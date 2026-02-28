@@ -1,3 +1,6 @@
+# Evaluation script for LLM-based VQA responses
+# Usage: python evaluate_llm.py --file1 predictions.json --file2 ground_truth.json --output results.json
+
 import argparse
 import transformers
 import torch

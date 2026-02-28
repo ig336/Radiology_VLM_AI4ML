@@ -1,8 +1,0 @@
-torch
-monai
-transformers
-codecarbon
-scikit-learn
-numpy
-pandas
-matplotlib

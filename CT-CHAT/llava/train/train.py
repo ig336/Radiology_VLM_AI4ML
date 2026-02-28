@@ -824,15 +824,86 @@ class LazySupervisedDataset(Dataset):
             length_list.append(cur_len)
         return length_list
 
-    def nii_img_to_tensor(self, path):
-        #nii_img = nib.load(str(path))
-        #img_data = nii_img.get_fdata()
-        embedding = np.load(path)["arr"]
-        #df = pd.read_csv("/shares/menze.dqbm.uzh/ihamam/ct-llava-codebase/LLaVA/llava/train/train_metadata.csv") #select the metadata
-        #file_name = path.split("/")[-1]
-        #row = df[df['VolumeName'] == file_name]
+    def augment_embeddings(self, embedding, is_train=True):
+        """
+        Apply feature-space augmentation to pre-encoded embeddings.
+        
+        Since CT volumes are pre-encoded, traditional spatial augmentation
+        (rotation, scaling, cropping) is not possible. Instead, we apply
+        augmentation in embedding space to improve model robustness.
+        
+        Args:
+            embedding (torch.Tensor): Shape (N_tokens, 512) - CTViT features
+            is_train (bool): Only augment during training
+        
+        Returns:
+            torch.Tensor: Augmented embeddings (may have fewer tokens if dropout applied)
+        
+        Augmentation strategies:
+            1. Token dropout (10% prob): Randomly drop 10% of tokens
+            2. Gaussian noise (20% prob): Add small noise (std=0.01)
+            3. Local token shuffling (30% prob): Shuffle within local windows
+        
+        Note:
+            To enable augmentation, set data_args.enable_augmentation=True
+        """
+        if not is_train or not getattr(self.data_args, 'enable_augmentation', False):
+            return embedding
+        
+        import random
+        
+        # 1. Token Dropout (10% probability, drop 10% of tokens)
+        if random.random() < 0.1:
+            n_tokens = embedding.shape[0]
+            n_keep = int(n_tokens * 0.9)
+            keep_indices = torch.randperm(n_tokens)[:n_keep]
+            embedding = embedding[keep_indices]
+        
+        # 2. Gaussian Noise (20% probability, small noise)
+        if random.random() < 0.2:
+            noise = torch.randn_like(embedding) * 0.01
+            embedding = embedding + noise
+        
+        # 3. Local Token Shuffling (30% probability)
+        # Shuffle within local windows to preserve some spatial structure
+        if random.random() < 0.3:
+            window_size = 48  # ~4x4x3 local region in token space (2304/48 = 48 windows)
+            n_tokens = embedding.shape[0]
+            n_windows = n_tokens // window_size
+            
+            for i in range(n_windows):
+                start = i * window_size
+                end = min(start + window_size, n_tokens)
+                perm = torch.randperm(end - start)
+                embedding[start:end] = embedding[start:end][perm]
+        
+        return embedding
 
-        return torch.tensor(embedding[0])
+    def nii_img_to_tensor(self, path):
+        """
+        Load pre-encoded CTViT embeddings from .npz files.
+        
+        In production, CT volumes are pre-encoded offline using encode_script.py
+        to save training time and memory. This method loads those embeddings.
+        
+        Args:
+            path (str): Path to .npz file containing encoded features
+        
+        Returns:
+            torch.Tensor: Shape (N_tokens, 512) - pre-encoded CTViT features
+        
+        Note:
+            Original NIfTI preprocessing pipeline is now done offline.
+            See llava/serve/encode_script.py for preprocessing details.
+        """
+        embedding = np.load(path)["arr"]
+        embedding_tensor = torch.tensor(embedding[0])
+        
+        # Apply feature-space augmentation if enabled
+        if hasattr(self, 'data_args'):
+            embedding_tensor = self.augment_embeddings(embedding_tensor, is_train=True)
+        
+        return embedding_tensor
 
         """
         slope = float(row["RescaleSlope"].iloc[0])
@@ -903,6 +974,8 @@ class LazySupervisedDataset(Dataset):
         return tensor
         """
 
+        # Output shape should be (1, T, H, W)
+
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
         if isinstance(i, int):
@@ -913,21 +986,16 @@ class LazySupervisedDataset(Dataset):
         if 'image' in sources[0]:
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
+            # Convert .nii.gz paths to .npz (pre-encoded embeddings)
             image_file = image_file.replace(".nii.gz", ".npz")
-            #name_list = image_file.split("_")
-            #name1 = "train_"+ name_list[1] + "/"
-            #name2 = "train_" + name_list[1] +"_" +name_list[2] + "/"
-
+            
+            # Load pre-encoded CTViT features
             embedding = self.nii_img_to_tensor(image_folder+image_file)
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
         else:
             sources = copy.deepcopy([e["conversations"] for e in sources])
-        #for source in sources:
-            #for s in source:
-                #if s["from"] == "human":
-                   # s["value"] = s["value"] + "<report_generation>" * 120000
         data_dict = preprocess(
             sources,
             self.tokenizer,
@@ -1003,23 +1071,23 @@ def train(attn_implementation=None):
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
 
     bnb_model_from_pretrained_args = {}
-    if training_args.bits in [4, 8]:
-        from transformers import BitsAndBytesConfig
-        bnb_model_from_pretrained_args.update(dict(
-            device_map={"": training_args.device},
-            load_in_4bit=training_args.bits == 4,
-            load_in_8bit=training_args.bits == 8,
-            quantization_config=BitsAndBytesConfig(
-                load_in_4bit=training_args.bits == 4,
-                load_in_8bit=training_args.bits == 8,
-                llm_int8_skip_modules=["mm_projector"],
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-                bnb_4bit_compute_dtype=compute_dtype,
-                bnb_4bit_use_double_quant=training_args.double_quant,
-                bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
-            )
-        ))
+    # if training_args.bits in [4, 8]:
+    #     from transformers import BitsAndBytesConfig
+    #     bnb_model_from_pretrained_args.update(dict(
+    #         device_map={"": training_args.device},
+    #         load_in_4bit=training_args.bits == 4,
+    #         load_in_8bit=training_args.bits == 8,
+    #         quantization_config=BitsAndBytesConfig(
+    #             load_in_4bit=training_args.bits == 4,
+    #             load_in_8bit=training_args.bits == 8,
+    #             llm_int8_skip_modules=["mm_projector"],
+    #             llm_int8_threshold=6.0,
+    #             llm_int8_has_fp16_weight=False,
+    #             bnb_4bit_compute_dtype=compute_dtype,
+    #             bnb_4bit_use_double_quant=training_args.double_quant,
+    #             bnb_4bit_quant_type=training_args.quant_type  # {'fp4', 'nf4'}
+    #         )
+    #     ))
 
     if model_args.vision_tower is not None:
         if 'mpt' in model_args.model_name_or_path:
@@ -1052,11 +1120,11 @@ def train(attn_implementation=None):
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
-    if training_args.bits in [4, 8]:
-        from peft import prepare_model_for_kbit_training
-        model.config.torch_dtype = (
-            torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-        model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
+    # if training_args.bits in [4, 8]:
+    #     from peft import prepare_model_for_kbit_training
+    #     model.config.torch_dtype = (
+    #         torch.float32 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    #     model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=training_args.gradient_checkpointing)
 
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
@@ -1077,11 +1145,11 @@ def train(attn_implementation=None):
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
+        # if training_args.bits == 16:
+        #     if training_args.bf16:
+        #         model.to(torch.bfloat16)
+        #     if training_args.fp16:
+        #         model.to(torch.float16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
@@ -1178,18 +1246,18 @@ def train(attn_implementation=None):
         
         model.config.pad_token_id = tokenizer.pad_token_id
 
-    if training_args.bits in [4, 8]:
-        from peft.tuners.lora import LoraLayer
-        for name, module in model.named_modules():
-            if isinstance(module, LoraLayer):
-                if training_args.bf16:
-                    module = module.to(torch.bfloat16)
-            if 'norm' in name:
-                module = module.to(torch.float32)
-            if 'lm_head' in name or 'embed_tokens' in name:
-                if hasattr(module, 'weight'):
-                    if training_args.bf16 and module.weight.dtype == torch.float32:
-                        module = module.to(torch.bfloat16)
+    # if training_args.bits in [4, 8]:
+    #     from peft.tuners.lora import LoraLayer
+    #     for name, module in model.named_modules():
+    #         if isinstance(module, LoraLayer):
+    #             if training_args.bf16:
+    #                 module = module.to(torch.bfloat16)
+    #         if 'norm' in name:
+    #             module = module.to(torch.float32)
+    #         if 'lm_head' in name or 'embed_tokens' in name:
+    #             if hasattr(module, 'weight'):
+    #                 if training_args.bf16 and module.weight.dtype == torch.float32:
+    #                     module = module.to(torch.bfloat16)
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)

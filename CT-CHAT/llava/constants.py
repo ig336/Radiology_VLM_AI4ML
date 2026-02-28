@@ -14,7 +14,7 @@ IMAGE_PLACEHOLDER = "<image-placeholder>"
 
 TOKEN_FOR_MULTIPLE_CHOICE = "<multiple_choice>"
 TOKEN_FOR_LONG_ANSWER = "<long_answer>"
-TOKEN_FOR_SHORT_ANSWER = "<short_answe>"
+TOKEN_FOR_SHORT_ANSWER = "<short_answer>"  # Fixed typo: was "<short_answe>"
 TOKEN_FOR_REPORT_GENERATION = "<report_generation>"
 
 

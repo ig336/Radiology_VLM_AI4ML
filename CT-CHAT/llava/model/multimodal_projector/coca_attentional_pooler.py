@@ -59,11 +59,26 @@ class AttentionalPooler(nn.Module):
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias=False)
         self.to_out = nn.Linear(inner_dim, d_model, bias=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, custom_queries: Optional[torch.Tensor] = None, return_attention: bool = False):
+        """
+        Args:
+            x: (B, N_tokens, D) - input token sequence
+            custom_queries: (B, n_queries, D) - optional custom query embeddings (for task-conditioning)
+            return_attention: bool - if True, return (output, attention_weights)
+        
+        Returns:
+            output: (B, n_queries, D) - compressed tokens
+            attention_weights (optional): (B, n_queries, N_tokens) - if return_attention=True
+        """
         if x.ndim == 3:
             x = rearrange(x, 'b n d -> b 1 n d')
 
-        q = repeat(self.query, 'n d -> b m n d', b=x.shape[0], m=x.shape[1])
+        # Use custom queries if provided, otherwise use learned queries
+        if custom_queries is not None:
+            # custom_queries: (B, n_queries, D)
+            q = rearrange(custom_queries, 'b n d -> b 1 n d')
+        else:
+            q = repeat(self.query, 'n d -> b m n d', b=x.shape[0], m=x.shape[1])
 
         x = self.ln_k(x)
         q = self.ln_q(q)
@@ -86,4 +101,11 @@ class AttentionalPooler(nn.Module):
 
         out = einsum('... i j, ... j d -> ... i d', attn, v)
         out = rearrange(out, 'b h t n d -> b t n (h d)', h=h)
-        return self.to_out(out).squeeze(dim=1)
+        output = self.to_out(out).squeeze(dim=1)
+        
+        if return_attention:
+            # Average attention across heads and squeeze temporal dimension
+            attn_weights = attn.mean(dim=1).squeeze(dim=1)  # (B, n_queries, N_tokens)
+            return output, attn_weights
+        else:
+            return output

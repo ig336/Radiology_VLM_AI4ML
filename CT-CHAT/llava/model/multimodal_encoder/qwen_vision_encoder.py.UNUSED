@@ -31,6 +31,7 @@ class Dinov3VisionEncoder(nn.Module):
                     tokens = torch.cat(tokens, dim=0).unsqueeze(0)  # (1, N_slices, C)
                     temporal_tokens.append(tokens)
                 # Fuse temporal tokens (mean pooling)
+                #! Remove mean pooling
                 fused = torch.mean(torch.cat(temporal_tokens, dim=0), dim=0, keepdim=True)  # (1, N_slices, C)
                 all_tokens.append(fused)
             return torch.cat(all_tokens, dim=0)  # (B, N_slices, C)

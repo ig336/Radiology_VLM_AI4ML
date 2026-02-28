@@ -6,7 +6,22 @@ Welcome to the official repository for **CT-CHAT**, a cutting-edge visual-langua
   <img src="figures/CTCHAT-demo.gif" width="100%">
 </p>
 
+---
 
+## 📚 Complete Documentation
+
+**For detailed technical documentation, pipeline architecture, and advanced features, see:**  
+👉 **[DOCUMENTATION.md](DOCUMENTATION.md)** 👈
+
+This comprehensive guide includes:
+- Complete pipeline architecture with tensor shapes
+- Token compression strategies (baseline, hierarchical, spatial, task-conditioned)
+- Training and inference workflows
+- Recent bug fixes and improvements (v3)
+- Production deployment guide
+- Testing and validation procedures
+
+---
 
 ## System Requirements
 

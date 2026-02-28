@@ -12,7 +12,7 @@ module load cuda/11.7 || true
 source ~/miniconda3/etc/profile.d/conda.sh
 conda activate vlm
 
-# Install requirements if needed (uncomment if first run)
+# Install requirements if needed
 # pip install -r requirements.txt
 
 # Run the main pipeline

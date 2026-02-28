@@ -12,6 +12,40 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+"""
+CT-CHAT LLaVA Architecture
+
+This module defines the core Vision-Language Model (VLM) architecture for CT-CHAT,
+adapted from LLaVA for 3D medical imaging.
+
+Key Architecture Components:
+1. Vision Encoder: CTViT (CT Vision Transformer) - pre-encoded offline
+2. Multimodal Projector: Attentional Pooler + MLP
+3. Language Model: Llama 3.1 / Vicuna / Mistral
+
+Production Pipeline:
+- Vision features are PRE-ENCODED using encode_script.py (CTViT)
+- Training loads .npz embeddings directly (no real-time encoding)
+- Vision tower code is kept for compatibility but bypassed in practice
+- mm_projector: 512-dim → 4096-dim with attention-based token compression
+
+Image Format Flow:
+    Pre-encoding (offline):
+        .nii.gz → CTViT → (N_tokens, 512) → save as .npz
+    
+    Training (with pre-encoded features):
+        .npz → load → (N_tokens, 512)
+             → flatten → (B, N_tokens*512)
+             → mm_projector → (B, N_compressed, 4096)
+             → inject into LLM at IMAGE_TOKEN positions
+
+Special Tokens for Medical VQA:
+    <multiple_choice> - for MCQ questions
+    <short_answer> - for brief clinical answers  
+    <long_answer> - for detailed explanations
+    <report_generation> - for full radiology reports
+"""
+
 
 from abc import ABC, abstractmethod
 
@@ -33,7 +67,13 @@ class LlavaMetaModel:
         super(LlavaMetaModel, self).__init__(config)
 
         if hasattr(config, "mm_vision_tower"):
+            # NOTE: Vision tower is NOT built here in production pipeline
+            # Pre-encoded CTViT features are loaded directly from .npz files
+            # Vision tower code kept for compatibility but not actively used
             #self.vision_tower = build_vision_tower(config, delay_load=True)
+            
+            # Build multimodal projector: 512-dim (CTViT) → 4096-dim (LLM)
+            # Uses AttentionalPooler for learned token compression
             self.mm_projector = build_vision_projector(config)
 
             if 'unpad' in getattr(config, 'mm_patch_merge_type', ''):
@@ -141,8 +181,27 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images):
-        #image_features = self.get_model().get_vision_tower()(images)
-        images = images.flatten(1, 3)
+        """
+        Project pre-encoded image features to LLM embedding space.
+        
+        In production, 'images' are actually pre-encoded CTViT features
+        loaded from .npz files, not raw CT volumes.
+        
+        Args:
+            images: Pre-encoded features of shape (B, N_tokens, 512)
+        
+        Returns:
+            Projected features of shape (B, N_compressed, 4096)
+        
+        Pipeline:
+            (B, N_tokens, 512) → flatten → (B, N_tokens*512)
+                               → mm_projector → (B, N_compressed, 4096)
+        
+        Note:
+            Vision tower encoding is bypassed - features are pre-computed offline.
+        """
+        #image_features = self.get_model().get_vision_tower()(images)  # Bypassed
+        images = images.flatten(1, 3)  # Flatten tokens and features
         image_features = self.get_model().mm_projector(images)
         return image_features
 
