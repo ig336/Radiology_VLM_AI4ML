@@ -1,3 +1,12 @@
+#!/bin/bash
+#SBATCH --job-name=ctchat_pretrain
+#SBATCH --output=ctchat_pretrain.out
+#SBATCH --error=ctchat_pretrain.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --time=48:00:00
+
 deepspeed --master_port 12438 llava/train/train_mem.py \
     --deepspeed ./zero3.json \
     --model_name_or_path meta-llama/Meta-Llama-3.1-8B-Instruct \

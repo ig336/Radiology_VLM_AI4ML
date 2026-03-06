@@ -1278,7 +1278,6 @@ def train(attn_implementation=None):
                     torch.save(non_lora_state_dict, os.path.join(checkpoint_dir, 'non_lora_trainables.bin'))
 
     trainer = LLaVATrainer(model=model,
-                           tokenizer=tokenizer,
                            args=training_args,
                            callbacks=[SaveCallback()],
                            **data_module)
