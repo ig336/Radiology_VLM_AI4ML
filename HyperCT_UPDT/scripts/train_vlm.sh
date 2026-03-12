@@ -14,12 +14,22 @@ module load anaconda3
 conda init bash
 conda activate test
 
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/AI4ML-initiative---Medical-VLM-Model
+# Install dependencies (confirmed working setup)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install einops open_clip_torch timm deepspeed ninja
+pip install flash-attn
+pip install transformers nibabel tqdm
+pip install "numpy<2"
+pip install --upgrade peft
+pip install --upgrade pip wheel
+pip install --force-reinstall --no-deps markupsafe==3.0.3
+
+PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
-torchrun --nproc_per_node=4 HyperCT_UPDT/train_vlm.py \
+torchrun --nproc_per_node=4 train_vlm.py \
     --tokens_dir ./precomputed_tokens \
-    --data_json /path/to/train_data.json \
+    --data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --output_dir ./checkpoints/hyperct_vlm \
     --llm_name meta-llama/Llama-3.1-8B-Instruct \
     --llm_hidden_size 4096 \
@@ -35,4 +45,5 @@ torchrun --nproc_per_node=4 HyperCT_UPDT/train_vlm.py \
     --batch_size 1 \
     --grad_accum 8 \
     --max_length 2048 \
-    --bf16
+    --bf16 \
+    --attn_implementation eager

@@ -14,11 +14,21 @@ module load anaconda3
 conda init bash
 conda activate test
 
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/AI4ML-initiative---Medical-VLM-Model
+# Install dependencies (confirmed working setup)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip install einops open_clip_torch timm deepspeed ninja
+pip install flash-attn
+pip install transformers nibabel tqdm
+pip install "numpy<2"
+pip install --upgrade peft
+pip install --upgrade pip wheel
+pip install --force-reinstall --no-deps markupsafe==3.0.3
+
+PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
-python HyperCT_UPDT/precompute_tokens.py \
-    --data_dir /path/to/nifti_files \
+python precompute_tokens.py \
+    --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train \
     --output_dir ./precomputed_tokens \
     --num_slices 32 \
     --slice_height 518 \

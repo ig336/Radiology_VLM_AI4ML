@@ -281,6 +281,8 @@ def main():
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
+    parser.add_argument("--attn_implementation", type=str, default="eager",
+                        choices=["eager", "flash_attention_2", "sdpa"])
     args = parser.parse_args()
 
     # Tokenizer
@@ -293,7 +295,7 @@ def main():
     llm = AutoModelForCausalLM.from_pretrained(
         args.llm_name,
         torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_implementation,
     )
 
     # LoRA on LLM
