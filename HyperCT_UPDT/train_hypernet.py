@@ -737,7 +737,7 @@ def main():
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--lora_scaling", type=float, default=1.0)
-    parser.add_argument("--num_slices", type=int, default=33)
+    parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
     parser.add_argument("--batch_size", type=int, default=2,

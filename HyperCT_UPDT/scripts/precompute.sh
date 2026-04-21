@@ -32,7 +32,7 @@ python precompute_tokens.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
     --output_dir ./precomputed_tokens \
     --checkpoint ./checkpoints/hypernet/best_checkpoint.pth \
-    --num_slices 33 \
+    --num_slices 90 \
     --slice_height 224 \
     --slice_width 224 \
     --cube_pool_levels 2 \

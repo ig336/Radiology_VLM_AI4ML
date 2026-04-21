@@ -39,7 +39,7 @@ python train_hypernet.py \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 \
     --lora_scaling 1.0 \
-    --num_slices 33 \
+    --num_slices 90 \
     --slice_height 224 \
     --slice_width 224 \
     --batch_size 2 \

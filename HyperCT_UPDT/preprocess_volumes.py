@@ -6,7 +6,7 @@ resampled slices. Dramatically speeds up training by eliminating
 per-sample NIfTI decompression and resampling.
 
 Speedup: ~10x faster data loading during training.
-Storage: ~6 MB per .pt file (33 slices × 224 × 224 × float32)
+Storage: ~16 MB per .pt file (90 slices × 224 × 224 × float32)
          vs 100-500 MB per .nii.gz (compressed 3D volume)
 
 Usage:
@@ -14,7 +14,7 @@ Usage:
         --data_dir /path/to/nifti_files \\
         --labels_json /path/to/labels.json \\
         --output_dir ./preprocessed \\
-        --num_slices 33 \\
+              --num_slices 90 \\
         --slice_height 224 \\
         --slice_width 224
 """
@@ -88,7 +88,7 @@ def main():
                         help="JSON with training records (to discover volumes)")
     parser.add_argument("--output_dir", type=str, default="./preprocessed",
                         help="Output directory for .pt files")
-    parser.add_argument("--num_slices", type=int, default=33)
+        parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
     args = parser.parse_args()
