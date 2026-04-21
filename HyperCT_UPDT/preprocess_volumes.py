@@ -13,7 +13,7 @@ Usage:
     python preprocess_volumes.py \\
         --data_dir /path/to/nifti_files \\
         --labels_json /path/to/labels.json \\
-        --output_dir ./preprocessed \\
+            --output_dir ./PreProcessed_train1 \\
               --num_slices 90 \\
         --slice_height 224 \\
         --slice_width 224
@@ -86,7 +86,7 @@ def main():
                         help="Directory with .nii.gz files")
     parser.add_argument("--labels_json", type=str, required=True,
                         help="JSON with training records (to discover volumes)")
-    parser.add_argument("--output_dir", type=str, default="./preprocessed",
+        parser.add_argument("--output_dir", type=str, default="./PreProcessed_train1",
                         help="Output directory for .pt files")
         parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
