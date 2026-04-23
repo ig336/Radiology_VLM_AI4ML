@@ -22,7 +22,7 @@ RADIOLOGICAL_TASKS = [
 class VisionConfig:
     encoder_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m"
     encoder_dim: int = 768
-    num_slices: int = 33  # divisible by 3
+    num_slices: int = 90  # divisible by 3
     # DINOv3 ViT-B native resolution (patch_size=16)
     slice_size: Tuple[int, int] = (224, 224)
     cube_pool_levels: int = 2  # 2x2x2 cube merging levels

@@ -72,7 +72,7 @@ class CTMultiLabelDataset(Dataset):
     """
 
     def __init__(self, data_dir: str, labels_json: str,
-                 slice_size: tuple = (224, 224), num_slices: int = 33,
+                 slice_size: tuple = (224, 224), num_slices: int = 90,
                  hu_min: float = -1000, hu_max: float = 1000,
                  preprocess_dir: str = None, augment: bool = False):
         with open(labels_json, "r") as f:
@@ -754,11 +754,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_batches_per_epoch", type=int, default=None,
                         help="Cap batches per epoch for faster iteration")
-    parser.add_argument("--preprocess_dir", type=str, default=None,
+    parser.add_argument("--preprocess_dir", type=str, default="/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/PreProcessed_train1",
                         help="Directory with preprocessed .pt volumes (from preprocess_volumes.py)")
-    parser.add_argument("--val_preprocess_dir", type=str, default=None,
-                        help="Directory with validation preprocessed .pt volumes "
-                             "(defaults to --preprocess_dir)")
+    parser.add_argument("--val_preprocess_dir", type=str, default="/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/PreProcessed_valid1",
+                        help="Directory with validation preprocessed .pt volumes (defaults to --preprocess_dir)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Resume from checkpoint")
     args = parser.parse_args()
