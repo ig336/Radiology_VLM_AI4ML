@@ -404,15 +404,13 @@ def _build_rgb_groups(volume_slices: torch.Tensor) -> torch.Tensor:
     return torch.stack(groups)  # (num_rgb, 3, H, W)
 
 
-def focal_loss_with_logits(logits, targets, gamma=2.0, pos_weight=None):
-    """Focal Loss for highly imbalanced multi-label CT datasets."""
+def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0):
+    """Standard alpha-balanced Focal Loss for highly imbalanced multi-label CT datasets."""
     probs = torch.sigmoid(logits)
     pt = torch.where(targets == 1.0, probs, 1.0 - probs)
     bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    focal_term = (1.0 - pt) ** gamma * bce_loss
-    if pos_weight is not None:
-        weight = torch.where(targets == 1.0, pos_weight, torch.ones_like(pos_weight))
-        focal_term = focal_term * weight
+    alpha_t = torch.where(targets == 1.0, alpha, 1.0 - alpha)
+    focal_term = alpha_t * (1.0 - pt) ** gamma * bce_loss
     return focal_term.mean()
 
 def train_one_epoch(
@@ -541,12 +539,7 @@ def train_one_epoch(
                 pooled_batch = torch.cat(pooled_list, dim=0)
                 logits = encoder.classify(pooled_batch)  # (K, num_tasks)
                 pred_logits = logits[:, chosen_task]     # (K,)
-                if pos_weight is not None:
-                    pw = pos_weight[chosen_task].expand_as(batch_task_labels)
-                    task_loss = focal_loss_with_logits(
-                        pred_logits, batch_task_labels, pos_weight=pw)
-                else:
-                    task_loss = focal_loss_with_logits(pred_logits, batch_task_labels)
+                task_loss = focal_loss_with_logits(pred_logits, batch_task_labels)
 
                 batch_loss = task_loss if batch_loss is None else batch_loss + task_loss
                 batch_task_updates += 1
@@ -680,13 +673,7 @@ def evaluate(
             pooled_batch = torch.cat(pooled_list, dim=0)
             logits = encoder.classify(pooled_batch)
             pred_logits = logits[:, chosen_task]
-            # Use per-task pos_weight to avoid shape mismatch
-            if pos_weight is not None:
-                pw = pos_weight[chosen_task].expand_as(batch_task_labels)
-                loss = focal_loss_with_logits(
-                    pred_logits, batch_task_labels, pos_weight=pw)
-            else:
-                loss = focal_loss_with_logits(pred_logits, batch_task_labels)
+            loss = focal_loss_with_logits(pred_logits, batch_task_labels)
             total_loss += loss.item()
             num_batches += 1
 
@@ -859,11 +846,12 @@ def main():
             pooler.load_state_dict(ckpt["pooler"])
             log.info("Loaded CubePooler from checkpoint")
 
-    # Optimizer: hypernet + classifier + CubePooler
+    # Optimizer: hypernet + classifier + CubePooler + unfrozen backbone norms
     trainable_params = [
         {"params": encoder.hypernet.parameters(), "lr": args.lr},
         {"params": encoder.classifier.parameters(), "lr": args.lr},
         {"params": pooler.parameters(), "lr": args.lr},
+        {"params": [p for p in encoder.encoder.parameters() if p.requires_grad], "lr": args.lr},
     ]
     optimizer = torch.optim.AdamW(
         trainable_params,
