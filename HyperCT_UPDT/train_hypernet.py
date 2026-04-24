@@ -563,14 +563,19 @@ def train_one_epoch(
         
         # Gradient Clipping to prevent catastrophic collapse
         scaler.unscale_(optimizer)
+        # Clip ALL parameters including backbone norms to prevent NaN explosion
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(encoder.hypernet.parameters()) +
-            list(encoder.classifier.parameters()) +
-            list(pooler.parameters()),
+            list(encoder.parameters()) + list(pooler.parameters()),
             max_norm=1.0,
         )
         if batch_idx % 100 == 0:
             log.info(f"  [Diag] Global Grad Norm: {grad_norm:.4f}")
+
+        # Safety check: Skip batch if NaNs occurred (prevents crashing auc calculation)
+        if torch.isnan(loss):
+            log.warning(f"  [Safety] NaN detected in loss at batch {batch_idx}. Skipping.")
+            optimizer.zero_grad()
+            continue
 
         scaler.step(optimizer)
         scaler.update()
@@ -769,8 +774,8 @@ def main():
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=32,
                         help="Increased from 16 to 32 for higher capacity in medical transfer")
-    parser.add_argument("--lora_scaling", type=float, default=4.0,
-                        help="Increased scaling to amplify LoRA impact (from 2.0 to 4.0)")
+    parser.add_argument("--lora_scaling", type=float, default=2.0,
+                        help="LoRA scaling factor (set to 2.0 for stability)")
     parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
@@ -870,10 +875,10 @@ def main():
             pooler.load_state_dict(ckpt["pooler"])
             log.info("Loaded CubePooler from checkpoint")
 
-    # Optimizer: hypernet gets 2x LR to kickstart weight generation
+    # Optimizer: hypernet gets 1.2x LR to encourage adaptation while staying stable
     backbone_params = [p for p in encoder.encoder.parameters() if p.requires_grad]
     trainable_params = [
-        {"params": encoder.hypernet.parameters(), "lr": args.lr * 2.0},
+        {"params": encoder.hypernet.parameters(), "lr": args.lr * 1.2},
         {"params": encoder.classifier.parameters(), "lr": args.lr},
         {"params": pooler.parameters(), "lr": args.lr},
         {"params": backbone_params, "lr": args.lr * 0.05},

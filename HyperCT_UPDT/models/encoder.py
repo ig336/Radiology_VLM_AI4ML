@@ -206,13 +206,13 @@ class LoRAHypernet(nn.Module):
             mlp_inp_size, mlp_inp_size * 4, mlp_inp_size)
         self.mlp2 = MLPResidualBlock(
             mlp_inp_size, mlp_inp_size * 4, mlp_inp_size)
-
         self.mlp3 = nn.Sequential(
             nn.LayerNorm(mlp_inp_size),
             nn.Linear(mlp_inp_size, mlp_inp_size * 4),
             nn.SiLU(),
             nn.Dropout(0.05),
             nn.Linear(mlp_inp_size * 4, head_in_size),
+            nn.LayerNorm(head_in_size),
         )
 
         # Per-module output heads with proper initialization
