@@ -404,8 +404,8 @@ def _build_rgb_groups(volume_slices: torch.Tensor) -> torch.Tensor:
     return torch.stack(groups)  # (num_rgb, 3, H, W)
 
 
-def focal_loss_with_logits(logits, targets, alpha=0.25, gamma=2.0):
-    """Standard alpha-balanced Focal Loss for highly imbalanced multi-label CT datasets."""
+def focal_loss_with_logits(logits, targets, alpha=0.75, gamma=2.0):
+    """Standard alpha-balanced Focal Loss. alpha=0.75 weights positives more."""
     probs = torch.sigmoid(logits)
     pt = torch.where(targets == 1.0, probs, 1.0 - probs)
     bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
@@ -552,13 +552,26 @@ def train_one_epoch(
 
         loss = batch_loss / batch_task_updates
         scaler.scale(loss).backward()
+
+        # Diagnostic: Monitor LoRA weight health and Gradient Norm
+        if batch_idx % 100 == 0:
+            with torch.no_grad():
+                # Extract one sample's LoRA magnitude as proxy
+                if "q_proj" in lora_w:
+                    l_norm = lora_w["q_proj"]["lora_B"][0].abs().mean().item()
+                    log.info(f"  [Diag] LoRA Magnitude (q_proj_B): {l_norm:.6f}")
+        
+        # Gradient Clipping to prevent catastrophic collapse
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             list(encoder.hypernet.parameters()) +
             list(encoder.classifier.parameters()) +
             list(pooler.parameters()),
             max_norm=1.0,
         )
+        if batch_idx % 100 == 0:
+            log.info(f"  [Diag] Global Grad Norm: {grad_norm:.4f}")
+
         scaler.step(optimizer)
         scaler.update()
 
@@ -684,14 +697,25 @@ def evaluate(
 
     # Compute per-task AUC then macro-average
     per_task_auc = {}
-    for task_idx in sorted(task_preds.keys()):
+    for task_idx in range(len(RADIOLOGICAL_TASKS)):
+        task_name = RADIOLOGICAL_TASKS[task_idx]
+        if task_idx not in task_preds or len(task_preds[task_idx]) == 0:
+            log.info(f"  Val | {task_name:25s}: No samples in val batch")
+            continue
+            
         p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
         t = torch.cat(task_targets[task_idx]).numpy()
+        
         if len(np.unique(t)) > 1:
             task_auc = roc_auc_score(t, p)
             per_task_auc[task_idx] = task_auc
-            log.info(f"  Val | {RADIOLOGICAL_TASKS[task_idx]}: "
-                     f"AUC={task_auc:.4f} (n={len(t)})")
+            log.info(f"  Val | {task_name:25s}: AUC={task_auc:.4f} (n={len(t)})")
+        else:
+            # Report 0.5 if task is uncalculatable due to class imbalance in val set
+            # but keep it in the log for transparency.
+            log.info(f"  Val | {task_name:25s}: AUC=0.5000 [Only one class present] (n={len(t)})")
+            per_task_auc[task_idx] = 0.5
+            
     val_auc = float(np.mean(list(per_task_auc.values()))
                     ) if per_task_auc else None
     if val_auc is not None:
@@ -846,12 +870,13 @@ def main():
             pooler.load_state_dict(ckpt["pooler"])
             log.info("Loaded CubePooler from checkpoint")
 
-    # Optimizer: hypernet + classifier + CubePooler + unfrozen backbone norms
+    # Optimizer: Use a smaller LR for the backbone norms (stable transfer)
+    backbone_params = [p for p in encoder.encoder.parameters() if p.requires_grad]
     trainable_params = [
         {"params": encoder.hypernet.parameters(), "lr": args.lr},
         {"params": encoder.classifier.parameters(), "lr": args.lr},
         {"params": pooler.parameters(), "lr": args.lr},
-        {"params": [p for p in encoder.encoder.parameters() if p.requires_grad], "lr": args.lr},
+        {"params": backbone_params, "lr": args.lr * 0.1},
     ]
     optimizer = torch.optim.AdamW(
         trainable_params,
@@ -862,14 +887,14 @@ def main():
     # Warmup for the first ~20% of epochs, then cosine decay to 1% of peak LR.
     # Without warmup the model jumps into a poor local minimum in epoch 1 and
     # val loss diverges on subsequent epochs.
-    warmup_epochs = max(1, args.epochs // 5)
+    warmup_epochs = 1
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.1, end_factor=1.0, total_iters=warmup_epochs,
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
-        T_max=max(1, args.epochs - warmup_epochs),
-        eta_min=args.lr * 0.01,
+        T_max=max(20, args.epochs * 2),  # Stretch decay out much further to stay at peak LR longer
+        eta_min=args.lr * 0.1,           # Don't let LR drop below 10% of peak
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer,
