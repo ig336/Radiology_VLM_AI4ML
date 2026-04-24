@@ -402,6 +402,13 @@ class DINOv3LoRAEncoder(nn.Module):
         # and save GPU memory. Only hypernet + classifier are trainable.
         # Gradients still flow through frozen layers for hypernet updates.
         self.encoder.requires_grad_(False)
+        
+        # UNFREEZE LayerNorms: Medical images (CT) have a drastically different
+        # feature distribution than natural images. Unfreezing just the norms
+        # allows the backbone to re-center features extremely cheaply.
+        for name, param in self.encoder.named_parameters():
+            if "norm" in name.lower():
+                param.requires_grad_(True)
 
         # ImageNet normalization (matches HyperCT reference: DINOv3_Encoder.preprocess)
         self.preprocess = transforms.Normalize(

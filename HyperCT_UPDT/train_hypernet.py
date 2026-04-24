@@ -404,6 +404,17 @@ def _build_rgb_groups(volume_slices: torch.Tensor) -> torch.Tensor:
     return torch.stack(groups)  # (num_rgb, 3, H, W)
 
 
+def focal_loss_with_logits(logits, targets, gamma=2.0, pos_weight=None):
+    """Focal Loss for highly imbalanced multi-label CT datasets."""
+    probs = torch.sigmoid(logits)
+    pt = torch.where(targets == 1.0, probs, 1.0 - probs)
+    bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    focal_term = (1.0 - pt) ** gamma * bce_loss
+    if pos_weight is not None:
+        weight = torch.where(targets == 1.0, pos_weight, torch.ones_like(pos_weight))
+        focal_term = focal_term * weight
+    return focal_term.mean()
+
 def train_one_epoch(
     encoder: DINOv3LoRAEncoder,
     optimizer: torch.optim.Optimizer,
@@ -466,11 +477,12 @@ def train_one_epoch(
                      f"total_valid_labels={vmask.sum().item()}, "
                      f"tasks_with_valid={int((valid_per_task > 0).sum().item())}/18")
 
-        chosen_task, batch_task_labels, sample_ok = sample_task_for_batch(labels, vmask)
-        if chosen_task is None or not sample_ok.any():
+        valid_counts = vmask.sum(dim=0)
+        tasks_in_batch = (valid_counts > 0).nonzero(as_tuple=True)[0].tolist()
+        if not tasks_in_batch:
             num_skipped += 1
             if num_skipped <= 3:
-                log.warning(f"  Skipping batch {batch_idx}: chosen_task={chosen_task}, "
+                log.warning(f"  Skipping batch {batch_idx}: no valid tasks, "
                             f"vmask_sum={vmask.sum().item()}, labels_range="
                             f"[{labels.min().item():.1f}, {labels.max().item():.1f}]")
             continue
@@ -482,8 +494,10 @@ def train_one_epoch(
         batch_logged_tasks = []
 
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
-            # Process the single sampled task
-            if True:
+            for chosen_task in tasks_in_batch:
+                sample_ok = vmask[:, chosen_task]
+                if not sample_ok.any():
+                    continue
 
                 task_slices = all_slices[sample_ok]  # (K, num_slices, H, W)
                 batch_task_labels = labels[sample_ok, chosen_task]
@@ -529,10 +543,10 @@ def train_one_epoch(
                 pred_logits = logits[:, chosen_task]     # (K,)
                 if pos_weight is not None:
                     pw = pos_weight[chosen_task].expand_as(batch_task_labels)
-                    task_loss = F.binary_cross_entropy_with_logits(
+                    task_loss = focal_loss_with_logits(
                         pred_logits, batch_task_labels, pos_weight=pw)
                 else:
-                    task_loss = criterion(pred_logits, batch_task_labels)
+                    task_loss = focal_loss_with_logits(pred_logits, batch_task_labels)
 
                 batch_loss = task_loss if batch_loss is None else batch_loss + task_loss
                 batch_task_updates += 1
@@ -669,10 +683,10 @@ def evaluate(
             # Use per-task pos_weight to avoid shape mismatch
             if pos_weight is not None:
                 pw = pos_weight[chosen_task].expand_as(batch_task_labels)
-                loss = F.binary_cross_entropy_with_logits(
+                loss = focal_loss_with_logits(
                     pred_logits, batch_task_labels, pos_weight=pw)
             else:
-                loss = criterion(pred_logits, batch_task_labels)
+                loss = focal_loss_with_logits(pred_logits, batch_task_labels)
             total_loss += loss.item()
             num_batches += 1
 
@@ -742,8 +756,10 @@ def main():
                         default="./checkpoint_ff")
     parser.add_argument("--encoder_name", type=str,
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
-    parser.add_argument("--lora_rank", type=int, default=16)
-    parser.add_argument("--lora_scaling", type=float, default=1.0)
+    parser.add_argument("--lora_rank", type=int, default=32,
+                        help="Increased from 16 to 32 for higher capacity in medical transfer")
+    parser.add_argument("--lora_scaling", type=float, default=2.0,
+                        help="Increased scaling to amplify LoRA impact")
     parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
