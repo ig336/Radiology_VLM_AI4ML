@@ -769,8 +769,8 @@ def main():
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=32,
                         help="Increased from 16 to 32 for higher capacity in medical transfer")
-    parser.add_argument("--lora_scaling", type=float, default=2.0,
-                        help="Increased scaling to amplify LoRA impact")
+    parser.add_argument("--lora_scaling", type=float, default=4.0,
+                        help="Increased scaling to amplify LoRA impact (from 2.0 to 4.0)")
     parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
@@ -870,13 +870,13 @@ def main():
             pooler.load_state_dict(ckpt["pooler"])
             log.info("Loaded CubePooler from checkpoint")
 
-    # Optimizer: Use a smaller LR for the backbone norms (stable transfer)
+    # Optimizer: hypernet gets 2x LR to kickstart weight generation
     backbone_params = [p for p in encoder.encoder.parameters() if p.requires_grad]
     trainable_params = [
-        {"params": encoder.hypernet.parameters(), "lr": args.lr},
+        {"params": encoder.hypernet.parameters(), "lr": args.lr * 2.0},
         {"params": encoder.classifier.parameters(), "lr": args.lr},
         {"params": pooler.parameters(), "lr": args.lr},
-        {"params": backbone_params, "lr": args.lr * 0.1},
+        {"params": backbone_params, "lr": args.lr * 0.05},
     ]
     optimizer = torch.optim.AdamW(
         trainable_params,
