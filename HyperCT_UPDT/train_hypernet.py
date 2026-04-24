@@ -466,12 +466,11 @@ def train_one_epoch(
                      f"total_valid_labels={vmask.sum().item()}, "
                      f"tasks_with_valid={int((valid_per_task > 0).sum().item())}/18")
 
-        valid_counts = vmask.sum(dim=0)
-        tasks_in_batch = (valid_counts > 0).nonzero(as_tuple=True)[0].tolist()
-        if not tasks_in_batch:
+        chosen_task, batch_task_labels, sample_ok = sample_task_for_batch(labels, vmask)
+        if chosen_task is None or not sample_ok.any():
             num_skipped += 1
             if num_skipped <= 3:
-                log.warning(f"  Skipping batch {batch_idx}: no valid tasks, "
+                log.warning(f"  Skipping batch {batch_idx}: chosen_task={chosen_task}, "
                             f"vmask_sum={vmask.sum().item()}, labels_range="
                             f"[{labels.min().item():.1f}, {labels.max().item():.1f}]")
             continue
@@ -483,10 +482,8 @@ def train_one_epoch(
         batch_logged_tasks = []
 
         with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
-            for chosen_task in tasks_in_batch:
-                sample_ok = vmask[:, chosen_task]
-                if not sample_ok.any():
-                    continue
+            # Process the single sampled task
+            if True:
 
                 task_slices = all_slices[sample_ok]  # (K, num_slices, H, W)
                 batch_task_labels = labels[sample_ok, chosen_task]
@@ -502,13 +499,19 @@ def train_one_epoch(
                 for i in range(K):
                     per_sample_rgb.append(_build_rgb_groups(task_slices[i]))
                 num_rgb = per_sample_rgb[0].shape[0]
-                all_rgb = torch.cat(per_sample_rgb, dim=0)  # (K*num_rgb, 3, H, W)
+                # Process each sample independently to avoid cross-contamination
+                # (averaging image condition across different patients)
+                all_tokens_list = []
+                for i in range(K):
+                    sample_rgb = per_sample_rgb[i]
+                    encoder.hypernet.set_image_conditioning(sample_rgb)
+                    lora_w = encoder.hypernet.generate_full_model_lora(task_id)
+                    encoder.hypernet.clear_image_conditioning()
+                    
+                    sample_tokens = encoder.forward_with_lora(sample_rgb, lora_w)
+                    all_tokens_list.append(sample_tokens)
 
-                encoder.hypernet.set_image_conditioning(all_rgb)
-                lora_w = encoder.hypernet.generate_full_model_lora(task_id)
-                encoder.hypernet.clear_image_conditioning()
-
-                all_tokens = encoder.forward_with_lora(all_rgb, lora_w)
+                all_tokens = torch.cat(all_tokens_list, dim=0)
                 # all_tokens: (K * num_rgb, N_patches, D)
 
                 # Split back per sample and pool with CubePooler
@@ -640,13 +643,17 @@ def evaluate(
 
             per_sample_rgb = [_build_rgb_groups(slices_k[i]) for i in range(K)]
             num_rgb = per_sample_rgb[0].shape[0]
-            all_rgb = torch.cat(per_sample_rgb, dim=0)
+            all_tokens_list = []
+            for i in range(K):
+                sample_rgb = per_sample_rgb[i]
+                encoder.hypernet.set_image_conditioning(sample_rgb)
+                lora_w = encoder.hypernet.generate_full_model_lora(task_id)
+                encoder.hypernet.clear_image_conditioning()
+                
+                sample_tokens = encoder.forward_with_lora(sample_rgb, lora_w)
+                all_tokens_list.append(sample_tokens)
 
-            encoder.hypernet.set_image_conditioning(all_rgb)
-            lora_w = encoder.hypernet.generate_full_model_lora(task_id)
-            encoder.hypernet.clear_image_conditioning()
-
-            all_tokens = encoder.forward_with_lora(all_rgb, lora_w)
+            all_tokens = torch.cat(all_tokens_list, dim=0)
 
             pooled_list = []
             for i in range(K):
@@ -745,7 +752,7 @@ def main():
                              "now processes all RGB groups (multi-slice 3D training).")
     parser.add_argument("--cube_pool_levels", type=int, default=2,
                         help="CubePooler 2x2x2 merging levels (must match precompute)")
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--early_stop_patience", type=int, default=3,
@@ -889,11 +896,10 @@ def main():
         n_pos = label_counts[i, 1]
         n_neg = label_counts[i, 0]
         if n_pos > 0:
-            # Cap at 10 to prevent extreme weights on very rare classes
-            # (e.g. pneumothorax 20 pos / 5000 neg → raw weight 250 destabilises training).
-            # A cap of 10 still strongly upweights rare positives without causing
+            # Cap at 50 to prevent extreme weights on very rare classes
+            # A cap of 50 still strongly upweights rare positives without causing
             # gradient explosion or pushing logits to ±inf in early epochs.
-            pos_weight[i] = min(max(n_neg / n_pos, 1.0), 10.0)
+            pos_weight[i] = min(max(n_neg / n_pos, 1.0), 50.0)
         else:
             pos_weight[i] = 1.0  # fallback if no positives
     for i, task in enumerate(RADIOLOGICAL_TASKS):
