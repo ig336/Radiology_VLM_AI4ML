@@ -4,7 +4,7 @@
 
 ```bash
 conda activate test
-cd /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HRadiology_VLM_AI4ML/HyperCT_UPDT
+cd /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT
 ```
 
 ---
@@ -18,8 +18,8 @@ Converts raw `.nii.gz` → fast `.pt` tensors. **Only needs to run once per data
 python preprocess_volumes.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
     --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
-    --output_dir ./preprocessed_train \
-    --num_slices 33 \
+    --output_dir ./PreProcessed_train1 \
+    --num_slices 90 \
     --slice_height 224 \
     --slice_width 224
 
@@ -27,14 +27,14 @@ python preprocess_volumes.py \
 python preprocess_volumes.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/valid_fixed \
     --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
-    --output_dir ./preprocessed_valid \
-    --num_slices 33 \
+    --output_dir ./PreProcessed_valid1 \
+    --num_slices 90 \
     --slice_height 224 \
     --slice_width 224
 ```
 
 **Time:** ~1-2 hours (CPU only)
-**Output:** `./preprocessed_train/*.pt` and `./preprocessed_valid/*.pt`
+**Output:** `./PreProcessed_train1/*.pt` and `./PreProcessed_valid1/*.pt`
 
 ---
 
@@ -54,19 +54,21 @@ python train_hypernet.py \
     --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
     --val_data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/valid_fixed \
-    --preprocess_dir ./preprocessed_train \
-    --output_dir ./checkpoints/hypernet \
+    --preprocess_dir ./PreProcessed_train1 \
+    --val_preprocess_dir ./PreProcessed_valid1 \
+    --output_dir ./checkpoint_ff \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 --lora_scaling 1.0 \
-    --num_slices 33 --slice_height 224 --slice_width 224 \
+    --num_slices 90 --slice_height 224 --slice_width 224 \
     --batch_size 2 --cube_pool_levels 2 \
-    --lr 1e-5 --weight_decay 1e-2 \
-    --epochs 20 --num_workers 4 \
-    --max_batches_per_epoch 5000 --seed 42
+    --lr 5e-5 --weight_decay 1e-2 \
+    --amp_dtype bf16 --grad_accum_steps 4 \
+    --pos_weight_power 0.5 --pos_weight_cap 20.0 \
+    --epochs 8 --num_workers 4 --seed 42
 ```
 
 **Resources:** 1 GPU, 128GB RAM, ~48 hours
-**Output:** `./checkpoints/hypernet/best_checkpoint.pth`
+**Output:** `./checkpoint_ff/best_checkpoint.pth`
 
 ---
 
@@ -84,8 +86,8 @@ sbatch scripts/precompute.sh
 python precompute_tokens.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
     --output_dir ./precomputed_tokens \
-    --checkpoint ./checkpoints/hypernet/best_checkpoint.pth \
-    --num_slices 33 --slice_height 224 --slice_width 224 \
+    --checkpoint ./checkpoint_ff/best_checkpoint.pth \
+    --num_slices 90 --slice_height 224 --slice_width 224 \
     --cube_pool_levels 2 \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
     --lora_rank 16 --lora_scaling 1.0
@@ -159,7 +161,7 @@ If Stage 1 gets interrupted:
 ```bash
 python train_hypernet.py \
     ... (same args) ... \
-    --checkpoint ./checkpoints/hypernet/epoch_<N>/checkpoint.pth
+    --checkpoint ./checkpoint_ff/epoch_<N>/checkpoint.pth
 ```
 
 ---

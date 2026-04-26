@@ -82,11 +82,30 @@ class VQADataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    def _resolve_token_path(self, image_ref: str) -> str:
+        candidates = []
+        candidates.append(os.path.join(self.tokens_dir, image_ref))
+
+        base = os.path.basename(image_ref)
+        if base.endswith(".nii.gz"):
+            base = base[:-7]
+        else:
+            base = os.path.splitext(base)[0]
+        candidates.append(os.path.join(self.tokens_dir, f"{base}.npz"))
+
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(
+            f"Could not find precomputed tokens for image={image_ref!r}. "
+            f"Tried: {candidates}"
+        )
+
     def __getitem__(self, idx):
         item = self.data[idx]
 
         # Load precomputed tokens
-        npz_path = os.path.join(self.tokens_dir, item["image"])
+        npz_path = self._resolve_token_path(item["image"])
         npz_data = np.load(npz_path)
         all_tokens = npz_data["tokens"]       # (num_tasks, T_out, 768)
         predictions = npz_data["predictions"]  # (num_tasks, num_tasks)

@@ -46,6 +46,7 @@ import random
 import json
 import os
 import math
+import re
 from config import RADIOLOGICAL_TASKS
 from models.encoder import DINOv3LoRAEncoder
 from models.pooling import ensure_length, pad_volume_slices, CubePooler
@@ -186,14 +187,6 @@ class CTMultiLabelDataset(Dataset):
           0  if the response explicitly says it is absent / not observed
          -1  (abstain) if not mentioned at all
         """
-        # Collect all GPT/assistant response text
-        # Support both "gpt" (legacy) and "assistant" (OpenAI/Llama chat format)
-        gpt_text = " ".join(
-            turn["value"].lower()
-            for turn in conversations
-            if turn.get("from") in ("gpt", "assistant")
-        )
-
         # Keyword map: task_name → (positive keywords, negative phrases)
         # IMPORTANT: negative phrases are checked FIRST. If a negative phrase
         # matches, the task is labelled 0 regardless of positive keywords.
@@ -220,9 +213,66 @@ class CTMultiLabelDataset(Dataset):
             "peribronchial_thickening": (["peribronchial thickening", "bronchial wall thickening"], ["no peribronchial", "without peribronchial"]),
             "hiatal_hernia":         (["hiatal hernia", "hiatus hernia"], ["no hiatal hernia", "without hiatal hernia"]),
         }
+        TASK_ALIASES = {
+            task: list(dict.fromkeys(pos + [task.replace("_", " ")]))
+            for task, (pos, _) in TASK_KEYWORDS.items()
+        }
+        YES_PHRASES = (
+            "yes", "present", "seen", "demonstrated", "identified", "noted",
+            "there is", "there are", "shows", "evidence of"
+        )
+        NO_PHRASES = (
+            "no", "absent", "without", "negative", "none",
+            "no evidence", "not seen", "not present", "not identified",
+            "not demonstrated"
+        )
+
+        def has_any(text: str, phrases) -> bool:
+            return any(p in text for p in phrases)
+
+        def has_answer_phrase(text: str, phrases) -> bool:
+            for phrase in phrases:
+                pattern = r"(?<![a-z0-9])" + re.escape(phrase) + r"(?![a-z0-9])"
+                if re.search(pattern, text):
+                    return True
+            return False
 
         labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
+
+        # First pass: use paired question/answer turns. CT-RATE VQA often asks
+        # "Is there X?" and the answer may simply be "No." Looking only at the
+        # assistant text would miss those negatives and corrupt class balance.
+        pending_question = ""
+        for turn in conversations:
+            role = turn.get("from")
+            text = str(turn.get("value", "")).lower()
+            if role == "human":
+                pending_question = text
+                continue
+            if role not in ("gpt", "assistant"):
+                continue
+
+            answer = text.strip()
+            for i, task in enumerate(RADIOLOGICAL_TASKS):
+                if not has_any(pending_question, TASK_ALIASES.get(task, [])):
+                    continue
+                _, neg_phrases = TASK_KEYWORDS.get(task, ([], []))
+                if has_any(answer, neg_phrases) or has_answer_phrase(answer, NO_PHRASES):
+                    labels[i] = 0.0
+                elif has_answer_phrase(answer, YES_PHRASES) or has_any(answer, TASK_ALIASES.get(task, [])):
+                    labels[i] = 1.0
+            pending_question = ""
+
+        # Second pass: free-text findings. Fill only tasks that the paired
+        # question/answer pass did not label.
+        gpt_text = " ".join(
+            str(turn.get("value", "")).lower()
+            for turn in conversations
+            if turn.get("from") in ("gpt", "assistant")
+        )
         for i, task in enumerate(RADIOLOGICAL_TASKS):
+            if labels[i] != -1:
+                continue
             pos_kws, neg_phrases = TASK_KEYWORDS.get(task, ([], []))
             # Negation check must come first — a sentence like "no mass lesion"
             # contains both "no mass" (neg) and "mass lesion" (pos). Checking
@@ -488,6 +538,19 @@ def _grad_group_norm(parameters) -> float:
     return math.sqrt(sq_sum) if found else 0.0
 
 
+def _resolve_amp_dtype(device: torch.device, amp_dtype: str):
+    if device.type != "cuda" or amp_dtype == "none":
+        return None
+    if amp_dtype == "bf16":
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        log.warning("bf16 AMP requested but this GPU does not support bf16; falling back to fp16.")
+        return torch.float16
+    if amp_dtype == "fp16":
+        return torch.float16
+    raise ValueError(f"Unknown amp_dtype={amp_dtype!r}")
+
+
 def train_one_epoch(
     encoder: DINOv3LoRAEncoder,
     optimizer: torch.optim.Optimizer,
@@ -502,6 +565,9 @@ def train_one_epoch(
     loss_type: str = "bce",
     focal_alpha: float = 0.75,
     focal_gamma: float = 2.0,
+    amp_dtype: torch.dtype = None,
+    grad_accum_steps: int = 1,
+    max_grad_norm: float = 1.0,
 ):
     """
     Train one epoch with multi-slice 3D-aware training.
@@ -529,6 +595,65 @@ def train_one_epoch(
     # methodologically wrong; compute per-task AUC then macro-average.
     task_preds: dict = defaultdict(list)
     task_targets: dict = defaultdict(list)
+    accum_count = 0
+    optimizer_steps = 0
+    last_lora_w = None
+    optimizer.zero_grad(set_to_none=True)
+
+    grad_accum_steps = max(int(grad_accum_steps), 1)
+
+    def optimizer_step(batch_idx: int, force: bool = False):
+        nonlocal accum_count, optimizer_steps
+        if accum_count == 0 or (not force and accum_count < grad_accum_steps):
+            return
+
+        # Diagnostic: Monitor LoRA weight health and Gradient Norm
+        do_diag = optimizer_steps % 25 == 0
+        if do_diag and last_lora_w is not None:
+            with torch.no_grad():
+                if "q_proj" in last_lora_w:
+                    l_norm = last_lora_w["q_proj"]["lora_B"][0].abs().mean().item()
+                    log.info(f"  [Diag] LoRA Magnitude (q_proj_B): {l_norm:.6f}")
+
+        # Gradient clipping must happen after unscale_ and before scaler.step().
+        # Every path after unscale_ must call scaler.update() before continuing.
+        scaler.unscale_(optimizer)
+        trainable_for_clip = [
+            p for p in list(encoder.parameters()) + list(pooler.parameters())
+            if p.requires_grad and p.grad is not None
+        ]
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_for_clip,
+            max_norm=max_grad_norm,
+        )
+        if do_diag:
+            log.info(f"  [Diag] Global Grad Norm: {grad_norm:.4f}")
+            norm_params = [
+                p for name, p in encoder.encoder.named_parameters()
+                if p.requires_grad and "norm" in name.lower()
+            ]
+            log.info(
+                "  [Diag] Grad groups | "
+                f"hypernet={_grad_group_norm(encoder.hypernet.parameters()):.4f} "
+                f"classifier={_grad_group_norm(encoder.classifier.parameters()):.4f} "
+                f"pooler={_grad_group_norm(pooler.parameters()):.4f} "
+                f"norms={_grad_group_norm(norm_params):.4f} "
+                f"accum={accum_count}"
+            )
+
+        if not torch.isfinite(grad_norm):
+            log.warning(f"  [Safety] Non-finite gradient norm at batch {batch_idx}: "
+                        f"{grad_norm}. Skipping accumulated optimizer step.")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
+            accum_count = 0
+            return
+
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        accum_count = 0
+        optimizer_steps += 1
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches and batch_idx >= max_batches:
@@ -563,7 +688,6 @@ def train_one_epoch(
                             f"[{labels.min().item():.1f}, {labels.max().item():.1f}]")
             continue
 
-        optimizer.zero_grad(set_to_none=True)
         batch_loss = None
         batch_task_updates = 0
         batch_valid = 0
@@ -571,8 +695,8 @@ def train_one_epoch(
 
         with torch.amp.autocast(
             device_type=device.type,
-            dtype=torch.float16,
-            enabled=device.type == "cuda",
+            dtype=amp_dtype,
+            enabled=amp_dtype is not None,
         ):
             for chosen_task in tasks_in_batch:
                 sample_ok = vmask[:, chosen_task]
@@ -600,6 +724,7 @@ def train_one_epoch(
                     sample_rgb = per_sample_rgb[i]
                     encoder.hypernet.set_image_conditioning(sample_rgb)
                     lora_w = encoder.hypernet.generate_full_model_lora(task_id)
+                    last_lora_w = lora_w
                     encoder.hypernet.clear_image_conditioning()
                     
                     sample_tokens = encoder.forward_with_lora(sample_rgb, lora_w)
@@ -644,53 +769,15 @@ def train_one_epoch(
         if not torch.isfinite(loss):
             log.warning(f"  [Safety] Non-finite loss at batch {batch_idx}: "
                         f"{loss.detach().item()}. Skipping before backward.")
-            optimizer.zero_grad(set_to_none=True)
             continue
 
-        scaler.scale(loss).backward()
+        scaler.scale(loss / grad_accum_steps).backward()
+        accum_count += 1
 
-        # Diagnostic: Monitor LoRA weight health and Gradient Norm
-        if batch_idx % 100 == 0:
-            with torch.no_grad():
-                # Extract one sample's LoRA magnitude as proxy
-                if "q_proj" in lora_w:
-                    l_norm = lora_w["q_proj"]["lora_B"][0].abs().mean().item()
-                    log.info(f"  [Diag] LoRA Magnitude (q_proj_B): {l_norm:.6f}")
-        
-        # Gradient clipping must happen after unscale_ and before scaler.step().
-        # Every path after unscale_ must call scaler.update() before continuing.
-        scaler.unscale_(optimizer)
-        trainable_for_clip = [
-            p for p in list(encoder.parameters()) + list(pooler.parameters())
-            if p.requires_grad and p.grad is not None
-        ]
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            trainable_for_clip,
-            max_norm=1.0,
-        )
-        if batch_idx % 100 == 0:
-            log.info(f"  [Diag] Global Grad Norm: {grad_norm:.4f}")
-            norm_params = [
-                p for name, p in encoder.encoder.named_parameters()
-                if p.requires_grad and "norm" in name.lower()
-            ]
-            log.info(
-                "  [Diag] Grad groups | "
-                f"hypernet={_grad_group_norm(encoder.hypernet.parameters()):.4f} "
-                f"classifier={_grad_group_norm(encoder.classifier.parameters()):.4f} "
-                f"pooler={_grad_group_norm(pooler.parameters()):.4f} "
-                f"norms={_grad_group_norm(norm_params):.4f}"
-            )
-
-        if not torch.isfinite(grad_norm):
-            log.warning(f"  [Safety] Non-finite gradient norm at batch {batch_idx}: "
-                        f"{grad_norm}. Skipping optimizer step.")
-            optimizer.zero_grad(set_to_none=True)
-            scaler.update()
-            continue
-
-        scaler.step(optimizer)
-        scaler.update()
+        is_last_batch = batch_idx + 1 >= len(dataloader)
+        if max_batches:
+            is_last_batch = is_last_batch or batch_idx + 1 >= max_batches
+        optimizer_step(batch_idx, force=is_last_batch)
 
         total_loss += loss.item()
         num_batches += 1
@@ -707,6 +794,8 @@ def train_one_epoch(
                      f"Valid {batch_valid}")
 
     avg_loss = total_loss / max(num_batches, 1)
+    log.info(f"Epoch {epoch} optimizer steps: {optimizer_steps} "
+             f"(grad_accum_steps={grad_accum_steps})")
 
     # Compute per-task AUC then macro-average (correct for paper reporting)
     per_task_auc = {}
@@ -903,8 +992,8 @@ def main():
                         default="./checkpoint_ff")
     parser.add_argument("--encoder_name", type=str,
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
-    parser.add_argument("--lora_rank", type=int, default=32,
-                        help="Increased from 16 to 32 for higher capacity in medical transfer")
+    parser.add_argument("--lora_rank", type=int, default=16,
+                        help="LoRA rank for generated adapters")
     parser.add_argument("--lora_scaling", type=float, default=1.0,
                         help="LoRA scaling factor (set to 1.0 for maximum stability)")
     parser.add_argument("--num_slices", type=int, default=90)
@@ -923,6 +1012,16 @@ def main():
                         help="Positive alpha used only when --loss_type focal")
     parser.add_argument("--focal_gamma", type=float, default=2.0,
                         help="Gamma used only when --loss_type focal")
+    parser.add_argument("--amp_dtype", choices=["bf16", "fp16", "none"], default="bf16",
+                        help="CUDA autocast dtype. bf16 avoids fp16 overflow when supported.")
+    parser.add_argument("--grad_accum_steps", type=int, default=4,
+                        help="Accumulate microbatch gradients before each optimizer step.")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0,
+                        help="Clip accumulated gradient norm to this value.")
+    parser.add_argument("--pos_weight_power", type=float, default=0.5,
+                        help="Use (neg/pos)^power for smoother rare-positive weighting.")
+    parser.add_argument("--pos_weight_cap", type=float, default=20.0,
+                        help="Maximum positive class weight per task.")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--early_stop_patience", type=int, default=3,
                         help="Stop if val loss doesn't improve for N epochs")
@@ -1071,10 +1170,11 @@ def main():
         n_pos = label_counts[i, 1]
         n_neg = label_counts[i, 0]
         if n_pos > 0:
-            # Cap at 50 to prevent extreme weights on very rare classes
-            # A cap of 50 still strongly upweights rare positives without causing
-            # gradient explosion or pushing logits to ±inf in early epochs.
-            pos_weight[i] = min(max(n_neg / n_pos, 1.0), 50.0)
+            # Smooth the imbalance ratio. Raw neg/pos can be huge for rare
+            # findings, causing noisy spikes from a single positive example.
+            ratio = max(n_neg / n_pos, 1.0)
+            pos_weight[i] = min(ratio ** args.pos_weight_power,
+                                args.pos_weight_cap)
         else:
             pos_weight[i] = 1.0  # fallback if no positives
     for i, task in enumerate(RADIOLOGICAL_TASKS):
@@ -1083,7 +1183,9 @@ def main():
     pos_weight = pos_weight.to(device)
     # no pos_weight here; passed per-task in train/eval
     criterion = nn.BCEWithLogitsLoss()
-    scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
+    amp_dtype = _resolve_amp_dtype(device, args.amp_dtype)
+    log.info(f"AMP dtype: {amp_dtype if amp_dtype is not None else 'disabled'}")
+    scaler = torch.amp.GradScaler(enabled=amp_dtype == torch.float16)
 
     # Training loop
     # Track best by val_auc (primary paper metric) with val_loss as tiebreaker.
@@ -1103,6 +1205,9 @@ def main():
             loss_type=args.loss_type,
             focal_alpha=args.focal_alpha,
             focal_gamma=args.focal_gamma,
+            amp_dtype=amp_dtype,
+            grad_accum_steps=args.grad_accum_steps,
+            max_grad_norm=args.max_grad_norm,
         )
 
         val_loss, val_auc = None, None

@@ -20,7 +20,7 @@ Usage:
     python precompute_tokens.py \\
         --data_dir /path/to/nifti_files \\
         --output_dir ./precomputed_tokens \\
-        --num_slices 33 \\
+        --num_slices 90 \\
         --cube_pool_levels 2
 """
 
@@ -184,7 +184,7 @@ def main():
                         default="./precomputed_tokens")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Encoder+HyperNet checkpoint")
-    parser.add_argument("--num_slices", type=int, default=33)
+    parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
     parser.add_argument("--cube_pool_levels", type=int, default=2)
