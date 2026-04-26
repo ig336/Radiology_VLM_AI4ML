@@ -212,7 +212,7 @@ class LoRAHypernet(nn.Module):
             nn.SiLU(),
             nn.Dropout(0.05),
             nn.Linear(mlp_inp_size * 4, head_in_size),
-            nn.LayerNorm(head_in_size),
+            nn.SiLU(), # Restored for output bounding
         )
 
         # Per-module output heads with proper initialization

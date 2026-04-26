@@ -37,17 +37,16 @@ python train_hypernet.py \
     --val_preprocess_dir /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/PreProcessed_valid1 \
     --output_dir ./checkpoint_ff \
     --encoder_name facebook/dinov3-vitb16-pretrain-lvd1689m \
-    --lora_rank 16 \
+    --lora_rank 32 \
     --lora_scaling 1.0 \
     --num_slices 90 \
     --slice_height 224 \
     --slice_width 224 \
     --batch_size 2 \
     --cube_pool_levels 2 \
-    --lr 1e-5 \
+    --lr 5e-5 \
     --weight_decay 1e-2 \
     --epochs 8 \
     --early_stop_patience 4 \
     --num_workers 4 \
-    --max_batches_per_epoch 5000 \
     --seed 42

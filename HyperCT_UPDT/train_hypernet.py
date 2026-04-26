@@ -45,6 +45,7 @@ import argparse
 import random
 import json
 import os
+import math
 from config import RADIOLOGICAL_TASKS
 from models.encoder import DINOv3LoRAEncoder
 from models.pooling import ensure_length, pad_volume_slices, CubePooler
@@ -235,13 +236,34 @@ class CTMultiLabelDataset(Dataset):
         return labels
 
     @staticmethod
+    def _coerce_label_value(value) -> float:
+        """Normalize explicit labels to {-1, 0, 1}."""
+        if isinstance(value, bool):
+            return 1.0 if value else 0.0
+        if isinstance(value, (int, float)):
+            if math.isnan(float(value)):
+                return -1.0
+            return float(value) if float(value) in (-1.0, 0.0, 1.0) else -1.0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "positive", "pos", "present"}:
+                return 1.0
+            if normalized in {"0", "false", "no", "negative", "neg", "absent"}:
+                return 0.0
+            if normalized in {"-1", "unknown", "uncertain", "abstain", "na", "n/a", ""}:
+                return -1.0
+        return -1.0
+
+    @staticmethod
     def _labels_from_record(rec: dict) -> torch.Tensor:
         """Build a multi-task label vector from merged record content."""
         labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
         if "labels" in rec and isinstance(rec["labels"], dict) and rec["labels"]:
             for i, task in enumerate(RADIOLOGICAL_TASKS):
                 if task in rec["labels"]:
-                    labels[i] = float(rec["labels"][task])
+                    labels[i] = CTMultiLabelDataset._coerce_label_value(
+                        rec["labels"][task]
+                    )
         # Fall through only for tasks still missing after explicit labels.
         if (labels == -1).any() and "conversations" in rec:
             conv_labels = CTMultiLabelDataset._labels_from_conversations(
@@ -404,14 +426,67 @@ def _build_rgb_groups(volume_slices: torch.Tensor) -> torch.Tensor:
     return torch.stack(groups)  # (num_rgb, 3, H, W)
 
 
-def focal_loss_with_logits(logits, targets, alpha=0.75, gamma=2.0):
-    """Standard alpha-balanced Focal Loss. alpha=0.75 weights positives more."""
+def supervised_loss_with_logits(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    pos_weight: torch.Tensor = None,
+    loss_type: str = "bce",
+    focal_alpha: float = 0.75,
+    focal_gamma: float = 2.0,
+) -> torch.Tensor:
+    """
+    Binary task loss with optional class balancing.
+
+    Weighted BCE is the default because it gives stronger early gradients than
+    focal loss on this sparse multi-label setup. Focal loss remains available
+    for experiments, but still uses the same per-task positive weight.
+    """
+    if pos_weight is not None:
+        pos_weight = pos_weight.to(device=logits.device, dtype=logits.dtype)
+        if pos_weight.ndim == 0:
+            pos_weight = pos_weight.expand_as(targets)
+
+    bce_loss = F.binary_cross_entropy_with_logits(
+        logits,
+        targets.to(dtype=logits.dtype),
+        pos_weight=pos_weight,
+        reduction="none",
+    )
+    if loss_type == "bce":
+        return bce_loss.mean()
+    if loss_type != "focal":
+        raise ValueError(f"Unknown loss_type={loss_type!r}; expected 'bce' or 'focal'")
+
     probs = torch.sigmoid(logits)
     pt = torch.where(targets == 1.0, probs, 1.0 - probs)
-    bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-    alpha_t = torch.where(targets == 1.0, alpha, 1.0 - alpha)
-    focal_term = alpha_t * (1.0 - pt) ** gamma * bce_loss
-    return focal_term.mean()
+    alpha_t = torch.where(
+        targets == 1.0,
+        torch.as_tensor(focal_alpha, device=logits.device, dtype=logits.dtype),
+        torch.as_tensor(1.0 - focal_alpha, device=logits.device, dtype=logits.dtype),
+    )
+    return (alpha_t * (1.0 - pt) ** focal_gamma * bce_loss).mean()
+
+
+def _safe_binary_auc(targets: np.ndarray, probs: np.ndarray):
+    finite = np.isfinite(targets) & np.isfinite(probs)
+    targets = targets[finite]
+    probs = probs[finite]
+    if targets.size == 0 or len(np.unique(targets)) < 2:
+        return None, targets.size
+    return roc_auc_score(targets, probs), targets.size
+
+
+def _grad_group_norm(parameters) -> float:
+    sq_sum = 0.0
+    found = False
+    for p in parameters:
+        if p.grad is None:
+            continue
+        found = True
+        grad = p.grad.detach().float()
+        sq_sum += grad.norm(2).item() ** 2
+    return math.sqrt(sq_sum) if found else 0.0
+
 
 def train_one_epoch(
     encoder: DINOv3LoRAEncoder,
@@ -424,6 +499,9 @@ def train_one_epoch(
     pooler: CubePooler,
     max_batches: int = None,
     pos_weight: torch.Tensor = None,
+    loss_type: str = "bce",
+    focal_alpha: float = 0.75,
+    focal_gamma: float = 2.0,
 ):
     """
     Train one epoch with multi-slice 3D-aware training.
@@ -485,13 +563,17 @@ def train_one_epoch(
                             f"[{labels.min().item():.1f}, {labels.max().item():.1f}]")
             continue
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         batch_loss = None
         batch_task_updates = 0
         batch_valid = 0
         batch_logged_tasks = []
 
-        with torch.amp.autocast(device_type=device.type, dtype=torch.float16):
+        with torch.amp.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=device.type == "cuda",
+        ):
             for chosen_task in tasks_in_batch:
                 sample_ok = vmask[:, chosen_task]
                 if not sample_ok.any():
@@ -539,7 +621,15 @@ def train_one_epoch(
                 pooled_batch = torch.cat(pooled_list, dim=0)
                 logits = encoder.classify(pooled_batch)  # (K, num_tasks)
                 pred_logits = logits[:, chosen_task]     # (K,)
-                task_loss = focal_loss_with_logits(pred_logits, batch_task_labels)
+                task_pos_weight = pos_weight[chosen_task] if pos_weight is not None else None
+                task_loss = supervised_loss_with_logits(
+                    pred_logits,
+                    batch_task_labels,
+                    pos_weight=task_pos_weight,
+                    loss_type=loss_type,
+                    focal_alpha=focal_alpha,
+                    focal_gamma=focal_gamma,
+                )
 
                 batch_loss = task_loss if batch_loss is None else batch_loss + task_loss
                 batch_task_updates += 1
@@ -551,6 +641,12 @@ def train_one_epoch(
             continue
 
         loss = batch_loss / batch_task_updates
+        if not torch.isfinite(loss):
+            log.warning(f"  [Safety] Non-finite loss at batch {batch_idx}: "
+                        f"{loss.detach().item()}. Skipping before backward.")
+            optimizer.zero_grad(set_to_none=True)
+            continue
+
         scaler.scale(loss).backward()
 
         # Diagnostic: Monitor LoRA weight health and Gradient Norm
@@ -561,20 +657,36 @@ def train_one_epoch(
                     l_norm = lora_w["q_proj"]["lora_B"][0].abs().mean().item()
                     log.info(f"  [Diag] LoRA Magnitude (q_proj_B): {l_norm:.6f}")
         
-        # Gradient Clipping to prevent catastrophic collapse
+        # Gradient clipping must happen after unscale_ and before scaler.step().
+        # Every path after unscale_ must call scaler.update() before continuing.
         scaler.unscale_(optimizer)
-        # Clip ALL parameters including backbone norms to prevent NaN explosion
+        trainable_for_clip = [
+            p for p in list(encoder.parameters()) + list(pooler.parameters())
+            if p.requires_grad and p.grad is not None
+        ]
         grad_norm = torch.nn.utils.clip_grad_norm_(
-            list(encoder.parameters()) + list(pooler.parameters()),
+            trainable_for_clip,
             max_norm=1.0,
         )
         if batch_idx % 100 == 0:
             log.info(f"  [Diag] Global Grad Norm: {grad_norm:.4f}")
+            norm_params = [
+                p for name, p in encoder.encoder.named_parameters()
+                if p.requires_grad and "norm" in name.lower()
+            ]
+            log.info(
+                "  [Diag] Grad groups | "
+                f"hypernet={_grad_group_norm(encoder.hypernet.parameters()):.4f} "
+                f"classifier={_grad_group_norm(encoder.classifier.parameters()):.4f} "
+                f"pooler={_grad_group_norm(pooler.parameters()):.4f} "
+                f"norms={_grad_group_norm(norm_params):.4f}"
+            )
 
-        # Safety check: Skip batch if NaNs occurred (prevents crashing auc calculation)
-        if torch.isnan(loss):
-            log.warning(f"  [Safety] NaN detected in loss at batch {batch_idx}. Skipping.")
-            optimizer.zero_grad()
+        if not torch.isfinite(grad_norm):
+            log.warning(f"  [Safety] Non-finite gradient norm at batch {batch_idx}: "
+                        f"{grad_norm}. Skipping optimizer step.")
+            optimizer.zero_grad(set_to_none=True)
+            scaler.update()
             continue
 
         scaler.step(optimizer)
@@ -601,11 +713,15 @@ def train_one_epoch(
     for task_idx in sorted(task_preds.keys()):
         p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
         t = torch.cat(task_targets[task_idx]).numpy()
-        if len(np.unique(t)) > 1:
-            task_auc = roc_auc_score(t, p)
+        task_auc, n_auc = _safe_binary_auc(t, p)
+        if task_auc is not None:
             per_task_auc[task_idx] = task_auc
             log.info(f"  Epoch {epoch} | {RADIOLOGICAL_TASKS[task_idx]}: "
-                     f"AUC={task_auc:.4f} (n={len(t)})")
+                     f"AUC={task_auc:.4f} (n={n_auc})")
+            if task_auc < 0.5:
+                log.warning(f"  [Diag] {RADIOLOGICAL_TASKS[task_idx]} train AUC "
+                            f"is below 0.5; inverted-logit AUC would be "
+                            f"{1.0 - task_auc:.4f}. Check label polarity/data split.")
     train_auc = float(np.mean(list(per_task_auc.values()))
                       ) if per_task_auc else None
     if train_auc is not None:
@@ -627,6 +743,9 @@ def evaluate(
     device: torch.device,
     pooler: CubePooler = None,
     pos_weight: torch.Tensor = None,
+    loss_type: str = "bce",
+    focal_alpha: float = 0.75,
+    focal_gamma: float = 2.0,
 ):
     """
     Evaluate on validation set with same multi-slice pipeline as training.
@@ -691,7 +810,15 @@ def evaluate(
             pooled_batch = torch.cat(pooled_list, dim=0)
             logits = encoder.classify(pooled_batch)
             pred_logits = logits[:, chosen_task]
-            loss = focal_loss_with_logits(pred_logits, batch_task_labels)
+            task_pos_weight = pos_weight[chosen_task] if pos_weight is not None else None
+            loss = supervised_loss_with_logits(
+                pred_logits,
+                batch_task_labels,
+                pos_weight=task_pos_weight,
+                loss_type=loss_type,
+                focal_alpha=focal_alpha,
+                focal_gamma=focal_gamma,
+            )
             total_loss += loss.item()
             num_batches += 1
 
@@ -711,15 +838,19 @@ def evaluate(
         p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
         t = torch.cat(task_targets[task_idx]).numpy()
         
-        if len(np.unique(t)) > 1:
-            task_auc = roc_auc_score(t, p)
+        task_auc, n_auc = _safe_binary_auc(t, p)
+        if task_auc is not None:
             per_task_auc[task_idx] = task_auc
-            log.info(f"  Val | {task_name:25s}: AUC={task_auc:.4f} (n={len(t)})")
+            log.info(f"  Val | {task_name:25s}: AUC={task_auc:.4f} (n={n_auc})")
+            if task_auc < 0.5:
+                log.warning(f"  [Diag] {task_name} val AUC is below 0.5; "
+                            f"inverted-logit AUC would be {1.0 - task_auc:.4f}. "
+                            f"Check label polarity/data split.")
         else:
-            # Report 0.5 if task is uncalculatable due to class imbalance in val set
-            # but keep it in the log for transparency.
-            log.info(f"  Val | {task_name:25s}: AUC=0.5000 [Only one class present] (n={len(t)})")
-            per_task_auc[task_idx] = 0.5
+            # AUC is undefined when only one class is present. Do not fold a
+            # synthetic 0.5 into macro-AUC; it would make the metric depend on
+            # validation label coverage instead of discrimination quality.
+            log.info(f"  Val | {task_name:25s}: AUC=N/A [Only one class present] (n={len(t)})")
             
     val_auc = float(np.mean(list(per_task_auc.values()))
                     ) if per_task_auc else None
@@ -774,8 +905,8 @@ def main():
                         default="facebook/dinov3-vitb16-pretrain-lvd1689m")
     parser.add_argument("--lora_rank", type=int, default=32,
                         help="Increased from 16 to 32 for higher capacity in medical transfer")
-    parser.add_argument("--lora_scaling", type=float, default=2.0,
-                        help="LoRA scaling factor (set to 2.0 for stability)")
+    parser.add_argument("--lora_scaling", type=float, default=1.0,
+                        help="LoRA scaling factor (set to 1.0 for maximum stability)")
     parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
@@ -784,8 +915,14 @@ def main():
                              "now processes all RGB groups (multi-slice 3D training).")
     parser.add_argument("--cube_pool_levels", type=int, default=2,
                         help="CubePooler 2x2x2 merging levels (must match precompute)")
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-2)
+    parser.add_argument("--loss_type", choices=["bce", "focal"], default="bce",
+                        help="Supervised task loss. Weighted BCE is the stable default.")
+    parser.add_argument("--focal_alpha", type=float, default=0.75,
+                        help="Positive alpha used only when --loss_type focal")
+    parser.add_argument("--focal_gamma", type=float, default=2.0,
+                        help="Gamma used only when --loss_type focal")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--early_stop_patience", type=int, default=3,
                         help="Stop if val loss doesn't improve for N epochs")
@@ -828,8 +965,12 @@ def main():
         encoder.load_state_dict(ckpt["encoder"], strict=False)
         log.info(f"Resumed from {args.checkpoint}")
 
-    # Freeze backbone explicitly
+    # Keep the pretrained backbone frozen except the normalization layers
+    # intentionally reopened in DINOv3LoRAEncoder.__init__ for CT adaptation.
     encoder.encoder.requires_grad_(False)
+    for name, param in encoder.encoder.named_parameters():
+        if "norm" in name.lower():
+            param.requires_grad_(True)
 
     # Log param counts
     total = sum(p.numel() for p in encoder.parameters())
@@ -959,12 +1100,18 @@ def main():
             pooler=pooler,
             max_batches=args.max_batches_per_epoch,
             pos_weight=pos_weight,
+            loss_type=args.loss_type,
+            focal_alpha=args.focal_alpha,
+            focal_gamma=args.focal_gamma,
         )
 
         val_loss, val_auc = None, None
         if val_loader is not None:
             val_loss, val_auc = evaluate(encoder, criterion, val_loader, device,
-                                         pooler=pooler, pos_weight=pos_weight)
+                                         pooler=pooler, pos_weight=pos_weight,
+                                         loss_type=args.loss_type,
+                                         focal_alpha=args.focal_alpha,
+                                         focal_gamma=args.focal_gamma)
 
         scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
