@@ -10,11 +10,12 @@ from typing import Tuple
 
 
 RADIOLOGICAL_TASKS = [
-    "opacity", "nodule", "consolidation", "atelectasis",
-    "pleural_effusion", "cardiomegaly", "emphysema", "fibrosis",
-    "bronchiectasis", "lymphadenopathy", "mass", "pneumothorax",
-    "pericardial_effusion", "calcification", "medical_material",
-    "mosaic_attenuation", "peribronchial_thickening", "hiatal_hernia",
+    "medical_material", "arterial_wall_calcification", "cardiomegaly",
+    "pericardial_effusion", "coronary_artery_wall_calcification",
+    "hiatal_hernia", "lymphadenopathy", "emphysema", "atelectasis",
+    "nodule", "opacity", "fibrosis", "pleural_effusion",
+    "mosaic_attenuation", "peribronchial_thickening", "consolidation",
+    "bronchiectasis", "interlobular_septal_thickening",
 ]
 
 

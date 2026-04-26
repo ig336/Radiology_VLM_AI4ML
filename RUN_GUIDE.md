@@ -51,8 +51,8 @@ sbatch scripts/train_hypernet.sh
 ```bash
 python train_hypernet.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
-    --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
-    --val_labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
+    --labels_csv /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/multi_abnormality_labels/train_predicted_labels.csv \
+    --val_labels_csv /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/multi_abnormality_labels/valid_predicted_labels.csv \
     --val_data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/valid_fixed \
     --preprocess_dir ./PreProcessed_train1 \
     --val_preprocess_dir ./PreProcessed_valid1 \

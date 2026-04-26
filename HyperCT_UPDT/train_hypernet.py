@@ -47,6 +47,7 @@ import json
 import os
 import math
 import re
+import csv
 from config import RADIOLOGICAL_TASKS
 from models.encoder import DINOv3LoRAEncoder
 from models.pooling import ensure_length, pad_volume_slices, CubePooler
@@ -73,39 +74,17 @@ class CTMultiLabelDataset(Dataset):
         - valid_mask: (num_tasks,) boolean mask of non-abstain labels
     """
 
-    def __init__(self, data_dir: str, labels_json: str,
+    def __init__(self, data_dir: str, labels_json: str = None,
                  slice_size: tuple = (224, 224), num_slices: int = 90,
                  hu_min: float = -1000, hu_max: float = 1000,
-                 preprocess_dir: str = None, augment: bool = False):
-        with open(labels_json, "r") as f:
-            all_records = json.load(f)
-        raw_records = [r for r in all_records if "image" in r]
-        log.info(f"Loaded {len(raw_records)} records with images "
-                 f"(skipped {len(all_records) - len(raw_records)} without)")
-
-        # Merge multiple VQA records per volume instead of keeping only the
-        # first one. CT-RATE VQA commonly stores separate QA records per scan,
-        # so "first record wins" throws away most task supervision.
-        seen = {}
-        for r in raw_records:
-            key = r["image"]
-            if key not in seen:
-                seen[key] = {
-                    **r,
-                    "labels": dict(r.get("labels", {}))
-                    if isinstance(r.get("labels"), dict) else {},
-                    "conversations": list(r.get("conversations", []))
-                    if isinstance(r.get("conversations"), list) else [],
-                }
-            else:
-                merged = seen[key]
-                if isinstance(r.get("labels"), dict):
-                    merged["labels"].update(r["labels"])
-                if isinstance(r.get("conversations"), list):
-                    merged["conversations"].extend(r["conversations"])
-        deduped = list(seen.values())
-        log.info(f"Deduplicated to {len(deduped)} unique volumes "
-                 f"(was {len(raw_records)} records)")
+                 preprocess_dir: str = None, augment: bool = False,
+                 labels_csv: str = None):
+        if labels_csv:
+            deduped = self._records_from_label_csv(labels_csv)
+        elif labels_json:
+            deduped = self._records_from_label_json(labels_json)
+        else:
+            raise ValueError("Provide either labels_json or labels_csv")
 
         # Filter out records with no valid (0/1) labels — these would be
         # skipped during training anyway, wasting I/O and compute.
@@ -134,6 +113,167 @@ class CTMultiLabelDataset(Dataset):
         return len(self.records)
 
     @staticmethod
+    def _records_from_label_json(labels_json: str) -> list:
+        with open(labels_json, "r") as f:
+            all_records = json.load(f)
+        raw_records = [r for r in all_records if "image" in r]
+        log.info(f"Loaded {len(raw_records)} JSON records with images "
+                 f"(skipped {len(all_records) - len(raw_records)} without)")
+
+        seen = {}
+        for r in raw_records:
+            key = r["image"]
+            if key not in seen:
+                seen[key] = {
+                    **r,
+                    "labels": dict(r.get("labels", {}))
+                    if isinstance(r.get("labels"), dict) else {},
+                    "conversations": list(r.get("conversations", []))
+                    if isinstance(r.get("conversations"), list) else [],
+                }
+            else:
+                merged = seen[key]
+                if isinstance(r.get("labels"), dict):
+                    merged["labels"].update(r["labels"])
+                if isinstance(r.get("conversations"), list):
+                    merged["conversations"].extend(r["conversations"])
+        deduped = list(seen.values())
+        log.info(f"Deduplicated to {len(deduped)} unique volumes "
+                 f"(was {len(raw_records)} JSON records)")
+        return deduped
+
+    @staticmethod
+    def _canonical_task_name(name: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "_", str(name).strip().lower()).strip("_")
+
+    @staticmethod
+    def _csv_task_column_map(fieldnames) -> dict:
+        canonical_to_task = {
+            CTMultiLabelDataset._canonical_task_name(task): task
+            for task in RADIOLOGICAL_TASKS
+        }
+        aliases = {
+            "opacity": ["opacity", "lung_opacity", "opacities"],
+            "nodule": ["nodule", "nodules", "lung_nodule", "pulmonary_nodule"],
+            "pleural_effusion": ["pleural_effusion", "effusion"],
+            "cardiomegaly": ["cardiomegaly", "enlarged_heart"],
+            "lymphadenopathy": ["lymphadenopathy", "lymphadenopathy_adenopathy",
+                                "enlarged_lymph_nodes", "lymph_nodes"],
+            "fibrosis": ["fibrosis", "pulmonary_fibrotic_sequela",
+                         "fibrotic_sequela"],
+            "arterial_wall_calcification": ["arterial_wall_calcification",
+                                            "arterial_calcification"],
+            "coronary_artery_wall_calcification": [
+                "coronary_artery_wall_calcification",
+                "coronary_artery_calcification",
+                "coronary_calcification",
+            ],
+            "pericardial_effusion": ["pericardial_effusion"],
+            "mosaic_attenuation": ["mosaic_attenuation",
+                                   "mosaic_attenuation_pattern"],
+            "peribronchial_thickening": ["peribronchial_thickening",
+                                         "bronchial_wall_thickening"],
+            "hiatal_hernia": ["hiatal_hernia", "hiatus_hernia"],
+            "interlobular_septal_thickening": [
+                "interlobular_septal_thickening",
+                "septal_thickening",
+            ],
+            "medical_material": ["medical_material", "medical_device",
+                                 "support_devices"],
+        }
+        for task, names in aliases.items():
+            for name in names:
+                canonical_to_task[name] = task
+
+        column_map = {}
+        for col in fieldnames or []:
+            canon = CTMultiLabelDataset._canonical_task_name(col)
+            if canon in {"volumename", "volume_name", "filename", "file_name",
+                         "image", "image_name", "path"}:
+                continue
+            task = canonical_to_task.get(canon)
+            if task is not None:
+                column_map.setdefault(task, []).append(col)
+        return column_map
+
+    @staticmethod
+    def _combine_csv_label_values(values) -> float:
+        labels = [
+            CTMultiLabelDataset._coerce_label_value(value)
+            for value in values
+        ]
+        if any(value == 1.0 for value in labels):
+            return 1.0
+        if any(value == 0.0 for value in labels):
+            return 0.0
+        return -1.0
+
+    @staticmethod
+    def _image_refs_from_volume_name(volume_name: str) -> list:
+        value = str(volume_name).strip()
+        if not value:
+            return []
+        base = os.path.basename(value)
+        if base.endswith(".npz"):
+            stem = base[:-4]
+        elif base.endswith(".nii.gz"):
+            stem = base[:-7]
+        else:
+            stem = os.path.splitext(base)[0]
+        candidates = [f"{stem}.nii.gz"]
+        split = stem.split("_", 1)[0]
+        if split in {"train", "valid", "validation"}:
+            split_dir = "valid_fixed" if split in {"valid", "validation"} else "train_fixed"
+            candidates.append(os.path.join(split_dir, f"{stem}.nii.gz"))
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _records_from_label_csv(labels_csv: str) -> list:
+        with open(labels_csv, "r", newline="") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames or []
+            volume_col = next(
+                (c for c in fieldnames
+                 if CTMultiLabelDataset._canonical_task_name(c)
+                 in {"volumename", "volume_name", "filename", "file_name",
+                     "image", "image_name"}),
+                None,
+            )
+            if volume_col is None:
+                raise ValueError(
+                    f"Could not find VolumeName/image column in {labels_csv}. "
+                    f"Columns: {fieldnames}"
+                )
+            task_cols = CTMultiLabelDataset._csv_task_column_map(fieldnames)
+            if not task_cols:
+                raise ValueError(
+                    f"Could not map any CSV columns in {labels_csv} to tasks "
+                    f"{RADIOLOGICAL_TASKS}. Columns: {fieldnames}"
+                )
+
+            records = []
+            for row in reader:
+                image_refs = CTMultiLabelDataset._image_refs_from_volume_name(row[volume_col])
+                if not image_refs:
+                    continue
+                labels = {}
+                for task, cols in task_cols.items():
+                    labels[task] = CTMultiLabelDataset._combine_csv_label_values(
+                        row.get(col, "") for col in cols
+                    )
+                records.append({
+                    "id": row.get(volume_col, image_refs[0]),
+                    "image": image_refs[0],
+                    "image_candidates": image_refs,
+                    "labels": labels,
+                })
+        mapped_columns = sum(len(cols) for cols in task_cols.values())
+        log.info(f"Loaded {len(records)} CSV label records from {labels_csv} "
+                 f"using {mapped_columns} columns for "
+                 f"{len(task_cols)}/{len(RADIOLOGICAL_TASKS)} tasks")
+        return records
+
+    @staticmethod
     def _resolve_nifti_path(data_dir: str, image_ref: str) -> str:
         """Resolve JSON image ref to actual nested path on disk.
 
@@ -144,16 +284,23 @@ class CTMultiLabelDataset(Dataset):
           patient_id = filename stem minus last two '_'-separated tokens  → train_13158
           series_id  = filename stem minus last '_'-separated token       → train_13158_c
         """
-        direct = os.path.join(data_dir, image_ref)
-        if os.path.exists(direct):
-            return direct
-        split_dir = os.path.dirname(image_ref)        # e.g. train_fixed
-        # e.g. train_13158_c_2.nii.gz
-        fname = os.path.basename(image_ref)
-        stem = fname.replace(".nii.gz", "")            # train_13158_c_2
-        series_id = stem.rsplit("_", 1)[0]             # train_13158_c
-        patient_id = series_id.rsplit("_", 1)[0]       # train_13158
-        return os.path.join(data_dir, split_dir, patient_id, series_id, fname)
+        for candidate in [image_ref]:
+            direct = os.path.join(data_dir, candidate)
+            if os.path.exists(direct):
+                return direct
+            split_dir = os.path.dirname(candidate)        # e.g. train_fixed
+            fname = os.path.basename(candidate)           # train_13158_c_2.nii.gz
+            stem = fname.replace(".nii.gz", "")           # train_13158_c_2
+            series_id = stem.rsplit("_", 1)[0]            # train_13158_c
+            patient_id = series_id.rsplit("_", 1)[0]      # train_13158
+            nested = os.path.join(data_dir, split_dir, patient_id, series_id, fname)
+            if os.path.exists(nested):
+                return nested
+            if split_dir:
+                nested_without_split = os.path.join(data_dir, patient_id, series_id, fname)
+                if os.path.exists(nested_without_split):
+                    return nested_without_split
+        return os.path.join(data_dir, image_ref)
 
     def _load_volume(self, path: str) -> torch.Tensor:
         """Load NIfTI, HU window, resample → (num_slices, H, W)."""
@@ -190,28 +337,29 @@ class CTMultiLabelDataset(Dataset):
         # Keyword map: task_name → (positive keywords, negative phrases)
         # IMPORTANT: negative phrases are checked FIRST. If a negative phrase
         # matches, the task is labelled 0 regardless of positive keywords.
-        # Positive keywords use word-boundary-safe strings (no trailing space
-        # hacks) to avoid false positives like "mass" missing end-of-sentence.
+        # Positive keywords use word-boundary-safe strings where needed to
+        # avoid substring false positives in fallback VQA parsing.
         TASK_KEYWORDS = {
             "opacity":               (["opaci", "opacification"], ["no opaci", "without opaci"]),
             "nodule":                (["nodule", "nodular"], ["no nodule", "without nodule", "no evidence of nodule"]),
             "consolidation":         (["consolidat"], ["no consolidat", "without consolidat"]),
             "atelectasis":           (["atelectas", "atelectatic"], ["no atelectas", "without atelectas"]),
             "pleural_effusion":      (["pleural effusion", "pleural fluid"], ["no pleural effusion", "pleural effusion was not", "no pleural fluid"]),
-            "cardiomegaly":          (["cardiomegaly", "enlarged heart", "cardiac enlargement"], ["no cardiomegaly", "heart size is normal", "normal cardiac size"]),
+            "cardiomegaly":          (["cardiomegaly", "enlarged heart", "cardiac enlargement", "heart size"], ["no cardiomegaly", "heart size is normal", "normal cardiac size", "heart contour, size are normal"]),
             "emphysema":             (["emphysema", "emphysematous"], ["no emphysema", "without emphysema"]),
             "fibrosis":              (["fibros", "fibrotic"], ["no fibros", "without fibros"]),
             "bronchiectasis":        (["bronchiectasis", "bronchiectatic"], ["no bronchiectasis", "without bronchiectasis"]),
-            "lymphadenopathy":       (["lymphadenopathy", "lymph node enlargement", "mediastinal lymph"], ["no lymphadenopathy", "no enlarged lymph"]),
-            # "mass" uses multi-word phrases only to avoid matching "no mass" substring
+            "lymphadenopathy":       (["lymphadenopathy", "lymph node enlargement", "lymph nodes", "enlarged lymph nodes", "mediastinal lymph"], ["no lymphadenopathy", "no enlarged lymph", "no lymph nodes"]),
             "mass":                  (["mass lesion", "soft tissue mass", "pulmonary mass", "lung mass", " masses"], ["no mass", "no evidence of mass"]),
             "pneumothorax":          (["pneumothorax"], ["no pneumothorax", "pneumothorax was not", "without pneumothorax"]),
             "pericardial_effusion":  (["pericardial effusion"], ["no pericardial effusion", "pericardial effusion was not", "pericardial effusion-thickening was not"]),
-            "calcification":         (["calcif", "calcific"], ["no calcif", "without calcif"]),
+            "arterial_wall_calcification": (["arterial wall calcif", "arterial calcif"], ["no arterial wall calcif", "without arterial wall calcif"]),
+            "coronary_artery_wall_calcification": (["coronary artery wall calcif", "coronary artery calcif", "coronary calcif"], ["no coronary artery wall calcif", "without coronary artery wall calcif", "no coronary calcif"]),
             "medical_material":      (["catheter", "pacemaker", "stent", "prosthes", "implant", "medical device", "chest tube"], []),
             "mosaic_attenuation":    (["mosaic attenuation", "mosaic pattern"], ["no mosaic", "without mosaic"]),
-            "peribronchial_thickening": (["peribronchial thickening", "bronchial wall thickening"], ["no peribronchial", "without peribronchial"]),
+            "peribronchial_thickening": (["peribronchial thickening", "bronchial wall thickening", "thickening of the bronchial wall"], ["no peribronchial", "without peribronchial", "no bronchial wall thickening"]),
             "hiatal_hernia":         (["hiatal hernia", "hiatus hernia"], ["no hiatal hernia", "without hiatal hernia"]),
+            "interlobular_septal_thickening": (["interlobular septal thickening", "septal thickening"], ["no interlobular septal thickening", "without interlobular septal thickening", "no septal thickening"]),
         }
         TASK_ALIASES = {
             task: list(dict.fromkeys(pos + [task.replace("_", " ")]))
@@ -224,7 +372,9 @@ class CTMultiLabelDataset(Dataset):
         NO_PHRASES = (
             "no", "absent", "without", "negative", "none",
             "no evidence", "not seen", "not present", "not identified",
-            "not demonstrated"
+            "not demonstrated", "not observed", "was not observed",
+            "were not observed", "is not observed", "are not observed",
+            "no findings"
         )
 
         def has_any(text: str, phrases) -> bool:
@@ -237,7 +387,8 @@ class CTMultiLabelDataset(Dataset):
                     return True
             return False
 
-        labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
+        pos_hits = torch.zeros(len(RADIOLOGICAL_TASKS), dtype=torch.bool)
+        neg_hits = torch.zeros(len(RADIOLOGICAL_TASKS), dtype=torch.bool)
 
         # First pass: use paired question/answer turns. CT-RATE VQA often asks
         # "Is there X?" and the answer may simply be "No." Looking only at the
@@ -258,31 +409,36 @@ class CTMultiLabelDataset(Dataset):
                     continue
                 _, neg_phrases = TASK_KEYWORDS.get(task, ([], []))
                 if has_any(answer, neg_phrases) or has_answer_phrase(answer, NO_PHRASES):
-                    labels[i] = 0.0
+                    neg_hits[i] = True
                 elif has_answer_phrase(answer, YES_PHRASES) or has_any(answer, TASK_ALIASES.get(task, [])):
-                    labels[i] = 1.0
+                    pos_hits[i] = True
             pending_question = ""
 
-        # Second pass: free-text findings. Fill only tasks that the paired
-        # question/answer pass did not label.
+        # Second pass: free-text findings/report text. Use sentence-level
+        # negation so "X was not observed" does not hide a separate positive
+        # sentence for another task. Final volume-level labels make positives
+        # win over negatives because any present finding should label the
+        # volume positive for that task.
         gpt_text = " ".join(
             str(turn.get("value", "")).lower()
             for turn in conversations
             if turn.get("from") in ("gpt", "assistant")
         )
+        sentences = [s.strip() for s in re.split(r"[.;\n]+", gpt_text) if s.strip()]
         for i, task in enumerate(RADIOLOGICAL_TASKS):
-            if labels[i] != -1:
-                continue
             pos_kws, neg_phrases = TASK_KEYWORDS.get(task, ([], []))
-            # Negation check must come first — a sentence like "no mass lesion"
-            # contains both "no mass" (neg) and "mass lesion" (pos). Checking
-            # neg first ensures the negative label wins.
-            neg_hit = any(neg in gpt_text for neg in neg_phrases)
-            if neg_hit:
-                labels[i] = 0.0
-            elif any(kw in gpt_text for kw in pos_kws):
-                labels[i] = 1.0
-            # else remains -1 (abstain)
+            aliases = TASK_ALIASES.get(task, pos_kws)
+            for sentence in sentences:
+                if not has_any(sentence, aliases):
+                    continue
+                if has_any(sentence, neg_phrases) or has_answer_phrase(sentence, NO_PHRASES):
+                    neg_hits[i] = True
+                else:
+                    pos_hits[i] = True
+
+        labels = torch.full((len(RADIOLOGICAL_TASKS),), -1.0)
+        labels[neg_hits] = 0.0
+        labels[pos_hits] = 1.0
         return labels
 
     @staticmethod
@@ -366,7 +522,15 @@ class CTMultiLabelDataset(Dataset):
                 slices = torch.load(pt_path, weights_only=True)
 
         if slices is None:
-            nifti_path = self._resolve_nifti_path(self.data_dir, rec["image"])
+            image_refs = rec.get("image_candidates") or [rec["image"]]
+            nifti_path = None
+            for image_ref in image_refs:
+                candidate = self._resolve_nifti_path(self.data_dir, image_ref)
+                if os.path.exists(candidate):
+                    nifti_path = candidate
+                    break
+            if nifti_path is None:
+                nifti_path = self._resolve_nifti_path(self.data_dir, rec["image"])
             if idx < 3:
                 log.info(f"[dataset] loading idx={idx}: {nifti_path}")
             slices = self._load_volume(nifti_path)  # (num_slices, H, W)
@@ -438,7 +602,7 @@ def sample_task_for_batch(labels: torch.Tensor, valid_mask: torch.Tensor):
     Pick ONE task for the entire batch using inverse-frequency weighted sampling.
 
     Tasks with fewer valid samples are sampled MORE often, ensuring rare tasks
-    (e.g. pneumothorax n=20, cardiomegaly n=28) get gradient signal instead of
+    (e.g. rare findings such as cardiomegaly or mosaic attenuation) get gradient signal instead of
     being crowded out by common tasks. This is the primary fix for AUC ~0.5 on
     rare tasks.
 
@@ -841,7 +1005,7 @@ def evaluate(
 
     Unlike training, evaluation iterates over ALL tasks that have valid labels
     in each batch — not just the most-common one. This ensures rare tasks
-    (pneumothorax, cardiomegaly) appear in the AUC computation instead of
+    (rare findings such as cardiomegaly or mosaic attenuation) appear in the AUC computation instead of
     being silently skipped, giving an accurate macro-AUC.
     """
     encoder.eval()
@@ -982,10 +1146,14 @@ def main():
     parser = argparse.ArgumentParser(description="Train HyperCT HyperNetwork")
     parser.add_argument("--data_dir", type=str, required=True,
                         help="Directory with .nii.gz files")
-    parser.add_argument("--labels_json", type=str, required=True,
-                        help="JSON with multi-label annotations")
+    parser.add_argument("--labels_json", type=str, default=None,
+                        help="JSON with VQA/multi-label annotations")
+    parser.add_argument("--labels_csv", type=str, default=None,
+                        help="CSV with structured CT-RATE multi-abnormality labels")
     parser.add_argument("--val_labels_json", type=str, default=None,
                         help="Optional validation labels JSON")
+    parser.add_argument("--val_labels_csv", type=str, default=None,
+                        help="Optional validation structured labels CSV")
     parser.add_argument("--val_data_dir", type=str, default=None,
                         help="Directory with validation .nii.gz files (defaults to --data_dir)")
     parser.add_argument("--output_dir", type=str,
@@ -1036,6 +1204,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Resume from checkpoint")
     args = parser.parse_args()
+    if not args.labels_json and not args.labels_csv:
+        parser.error("Provide --labels_csv for structured labels or --labels_json for VQA labels")
 
     # Seed
     random.seed(args.seed)
@@ -1082,6 +1252,7 @@ def main():
     train_ds = CTMultiLabelDataset(
         args.data_dir, args.labels_json, slice_size, args.num_slices,
         preprocess_dir=args.preprocess_dir, augment=True,
+        labels_csv=args.labels_csv,
     )
     use_persistent = args.num_workers > 0
     train_loader = DataLoader(
@@ -1092,12 +1263,13 @@ def main():
     log.info(f"Training set: {len(train_ds)} volumes")
 
     val_loader = None
-    if args.val_labels_json:
+    if args.val_labels_json or args.val_labels_csv:
         val_data_dir = args.val_data_dir or args.data_dir
         val_preprocess_dir = args.val_preprocess_dir or args.preprocess_dir
         val_ds = CTMultiLabelDataset(
             val_data_dir, args.val_labels_json, slice_size, args.num_slices,
             preprocess_dir=val_preprocess_dir,
+            labels_csv=args.val_labels_csv,
         )
         val_loader = DataLoader(
             val_ds, batch_size=args.batch_size, shuffle=False,
