@@ -25,7 +25,7 @@ pip install --upgrade peft
 pip install --upgrade pip wheel
 pip install --force-reinstall --no-deps markupsafe==3.0.3
 
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT
+PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
 python train_hypernet.py \
@@ -33,8 +33,8 @@ python train_hypernet.py \
     --labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_labels_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
     --val_data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/valid_fixed \
-    --labels_csv /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_predicted_labels.csv \
-    --val_labels_csv /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_predicted_labels.csv \
+    --labels_csv /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/multi_abnormality_labels/train_predicted_labels.csv \
+    --val_labels_csv /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/multi_abnormality_labels/valid_predicted_labels.csv \
     --preprocess_dir /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/PreProcessed_train1 \
     --val_preprocess_dir /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/PreProcessed_valid1 \
     --output_dir ./checkpoint_ff \
@@ -54,6 +54,7 @@ python train_hypernet.py \
     --pos_weight_power 0.5 \
     --pos_weight_cap 20.0 \
     --epochs 8 \
+    --max_batches_per_epoch 5000 \
     --early_stop_patience 4 \
     --num_workers 4 \
     --seed 42

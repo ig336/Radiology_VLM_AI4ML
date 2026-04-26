@@ -956,8 +956,8 @@ def train_one_epoch(
 
         # Collect per-task for AUC
         for chosen_task, pred_logits, batch_task_labels in batch_logged_tasks:
-            task_preds[chosen_task].append(pred_logits.detach().cpu())
-            task_targets[chosen_task].append(batch_task_labels.detach().cpu())
+            task_preds[chosen_task].append(pred_logits.detach().float().cpu())
+            task_targets[chosen_task].append(batch_task_labels.detach().float().cpu())
 
         if batch_idx % 10 == 0:
             log.info(f"Epoch {epoch} | Batch {batch_idx}/{len(dataloader)} | "
@@ -971,8 +971,8 @@ def train_one_epoch(
     # Compute per-task AUC then macro-average (correct for paper reporting)
     per_task_auc = {}
     for task_idx in sorted(task_preds.keys()):
-        p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
-        t = torch.cat(task_targets[task_idx]).numpy()
+        p = torch.cat(task_preds[task_idx]).float().sigmoid().numpy()
+        t = torch.cat(task_targets[task_idx]).float().numpy()
         task_auc, n_auc = _safe_binary_auc(t, p)
         if task_auc is not None:
             per_task_auc[task_idx] = task_auc
@@ -1082,8 +1082,8 @@ def evaluate(
             total_loss += loss.item()
             num_batches += 1
 
-            task_preds[chosen_task].append(pred_logits.cpu())
-            task_targets[chosen_task].append(batch_task_labels.cpu())
+            task_preds[chosen_task].append(pred_logits.float().cpu())
+            task_targets[chosen_task].append(batch_task_labels.float().cpu())
 
     avg_loss = total_loss / max(num_batches, 1)
 
@@ -1095,8 +1095,8 @@ def evaluate(
             log.info(f"  Val | {task_name:25s}: No samples in val batch")
             continue
 
-        p = torch.cat(task_preds[task_idx]).sigmoid().numpy()
-        t = torch.cat(task_targets[task_idx]).numpy()
+        p = torch.cat(task_preds[task_idx]).float().sigmoid().numpy()
+        t = torch.cat(task_targets[task_idx]).float().numpy()
 
         task_auc, n_auc = _safe_binary_auc(t, p)
         if task_auc is not None:
