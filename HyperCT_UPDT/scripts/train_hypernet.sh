@@ -42,7 +42,7 @@ python train_hypernet.py \
     --num_slices 90 \
     --slice_height 224 \
     --slice_width 224 \
-    --batch_size 2 \
+    --batch_size 1 \
     --cube_pool_levels 2 \
     --lr 5e-5 \
     --weight_decay 1e-2 \
@@ -52,6 +52,7 @@ python train_hypernet.py \
     --pos_weight_power 0.5 \
     --pos_weight_cap 20.0 \
     --epochs 8 \
-    --early_stop_patience 4 \
     --num_workers 4 \
+    --max_batches_per_epoch 10000 \
+    --early_stop_patience 4 \
     --seed 42
