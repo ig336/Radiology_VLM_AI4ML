@@ -1,0 +1,40 @@
+# Python environment setup
+# Target: Python 3.9.13
+# Install PyTorch separately via: pip install torch==2.0.1 torchvision==0.15.2 --index-url https://download.pytorch.org/whl/cu118
+
+# Core ML / Training
+transformers==4.30.2
+tokenizers==0.13.3
+accelerate==0.21.0
+deepspeed==0.10.3
+peft==0.5.0
+bitsandbytes==0.41.3
+
+# Data & Medical Imaging
+numpy==1.26.4
+pandas==2.0.3
+nibabel==5.1.0
+Pillow==10.0.0
+
+# Serving
+fastapi==0.103.2
+uvicorn==0.22.0
+gradio==3.50.2
+requests==2.31.0
+
+# Utilities
+tqdm==4.65.0
+packaging==23.2
+six==1.16.0
+
+# Visualization
+matplotlib==3.7.5
+
+# Jupyter / Notebook support
+matplotlib-inline==0.1.6
+jupyter_client==7.4.9
+ipykernel==6.25.2
+ipython==8.12.3
+debugpy==1.8.0
+traitlets==5.9.0
+pyzmq==25.1.2
