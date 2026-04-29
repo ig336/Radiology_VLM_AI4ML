@@ -25,13 +25,14 @@ pip install --upgrade peft
 pip install --upgrade pip wheel
 pip install --force-reinstall --no-deps markupsafe==3.0.3
 
-PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/HRadiology_VLM_AI4ML/HyperCT_UPDT
+PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
 python precompute_tokens.py \
     --data_dir /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/train_fixed \
-    --output_dir ./precomputed_tokens \
-    --checkpoint ./checkpoints/hypernet/best_checkpoint.pth \
+    --preprocess_dir /midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT/PreProcessed_train1 \
+    --output_dir ./precompute_tokens_ff \
+    --checkpoint ./checkpoint_ff/best_checkpoint.pth \
     --num_slices 90 \
     --slice_height 224 \
     --slice_width 224 \

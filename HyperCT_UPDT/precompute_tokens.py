@@ -1,13 +1,15 @@
 """Precompute Vision Tokens for HyperCT_UPDT Pipeline
 
-Processes 3D CT volumes (.nii.gz) through DINOv3 ViT-B + task-specific
-LoRA and saves pooled vision tokens as .npz files for downstream training.
+Processes preprocessed CT tensors (.pt) or raw 3D CT volumes (.nii.gz)
+through DINOv3 ViT-B + task-specific LoRA and saves pooled vision tokens
+as .npz files for downstream training.
 
 Uses facebook/dinov3-vitb16-pretrain-lvd1689m (arXiv 2508.10104).
 Follows HyperCT reference architecture (github.com/lfb-1/HyperCT).
 
 Pipeline per volume (following HyperCT reference architecture):
-    1. Load .nii.gz -> HU windowing -> ensure_length(divisible by 3) -> slice
+    1. Prefer train_hypernet/preprocess_volumes .pt tensors; optionally fall
+       back to .nii.gz -> HU windowing -> ensure_length(divisible by 3) -> slice
     2. Group 3 consecutive slices into RGB images (R=slice_i, G=slice_{i+1},
        B=slice_{i+2}) — provides inter-slice anatomical context
     3. For each task (18 radiological labels):
@@ -95,6 +97,57 @@ def load_nifti_slices(path: str, num_slices: int, slice_size: tuple,
     return slices
 
 
+def load_preprocessed_slices(path: str, num_slices: int,
+                             slice_size: tuple) -> torch.Tensor:
+    """
+    Load slices from preprocess_volumes.py output.
+
+    The training dataset consumes these same tensors, so using them here keeps
+    Stage 1 training and Stage 2 token generation on the same deterministic
+    volume representation while avoiding repeated NIfTI decompression.
+    """
+    try:
+        slices = torch.load(path, weights_only=True)
+    except TypeError:
+        slices = torch.load(path)
+    if isinstance(slices, np.ndarray):
+        slices = torch.from_numpy(slices)
+    if not torch.is_tensor(slices):
+        raise TypeError(f"Expected tensor/ndarray in {path}, got {type(slices)}")
+    slices = slices.float()
+    if slices.ndim == 4 and slices.shape[0] == 1:
+        slices = slices.squeeze(0)
+    if slices.ndim != 3:
+        raise ValueError(f"Expected preprocessed slices with shape (D,H,W), "
+                         f"got {tuple(slices.shape)} from {path}")
+
+    target = ensure_length(num_slices, divisor=3)
+    slices = pad_volume_slices(slices, target)
+    if tuple(slices.shape[-2:]) != tuple(slice_size):
+        log.warning(f"Preprocessed tensor {path} has spatial shape "
+                    f"{tuple(slices.shape[-2:])}; resizing to {slice_size}")
+        slices = F.interpolate(
+            slices.unsqueeze(0),
+            size=(slice_size[0], slice_size[1]),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return slices
+
+
+def resolve_preprocessed_path(preprocess_dir: str, volume_path: str) -> str:
+    """Map a raw NIfTI path to the flat .pt name produced by preprocess_volumes.py."""
+    if not preprocess_dir:
+        return None
+    vol_name = Path(volume_path).name
+    if vol_name.endswith(".nii.gz"):
+        pt_name = vol_name[:-7] + ".pt"
+    else:
+        pt_name = Path(vol_name).stem + ".pt"
+    pt_path = os.path.join(preprocess_dir, pt_name)
+    return pt_path if os.path.exists(pt_path) else None
+
+
 def slices_to_rgb(volume_slices: torch.Tensor, group_idx: int) -> torch.Tensor:
     """
     Stack 3 consecutive CT slices as RGB channels (HyperCT reference).
@@ -119,6 +172,7 @@ def precompute_single_volume(
     num_slices: int,
     slice_size: tuple,
     device: torch.device,
+    preprocess_path: str = None,
 ) -> dict:
     """
     Precompute vision tokens for one CT volume, all tasks.
@@ -131,7 +185,10 @@ def precompute_single_volume(
             'predictions': (num_tasks, num_tasks) classifier logits
             'tasks': list of task names
     """
-    slices = load_nifti_slices(volume_path, num_slices, slice_size)
+    if preprocess_path is not None:
+        slices = load_preprocessed_slices(preprocess_path, num_slices, slice_size)
+    else:
+        slices = load_nifti_slices(volume_path, num_slices, slice_size)
     actual_slices = slices.shape[0]
     num_rgb_images = actual_slices // 3  # HyperCT: 3 slices per RGB image
 
@@ -184,6 +241,11 @@ def main():
                         default="./precomputed_tokens")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Encoder+HyperNet checkpoint")
+    parser.add_argument("--preprocess_dir", type=str, default=None,
+                        help="Optional directory with preprocess_volumes.py .pt tensors.")
+    parser.add_argument("--allow_raw_fallback", action="store_true",
+                        help="Allow missing .pt tensors to fall back to raw .nii.gz. "
+                             "Default is strict 100%% .pt coverage when --preprocess_dir is set.")
     parser.add_argument("--num_slices", type=int, default=90)
     parser.add_argument("--slice_height", type=int, default=224)
     parser.add_argument("--slice_width", type=int, default=224)
@@ -230,6 +292,30 @@ def main():
 
     nifti_files = sorted(Path(args.data_dir).rglob("*.nii.gz"))
     log.info(f"Found {len(nifti_files)} volumes in {args.data_dir}")
+    preprocessed_paths = {}
+    if args.preprocess_dir:
+        if not os.path.isdir(args.preprocess_dir):
+            raise FileNotFoundError(
+                f"--preprocess_dir does not exist: {args.preprocess_dir}")
+        preprocessed_paths = {
+            str(vol_path): resolve_preprocessed_path(args.preprocess_dir, str(vol_path))
+            for vol_path in nifti_files
+        }
+        cache_hits = sum(path is not None for path in preprocessed_paths.values())
+        coverage = 100.0 * cache_hits / max(len(nifti_files), 1)
+        log.info(f"Preprocessed cache coverage: {cache_hits}/{len(nifti_files)} "
+                 f"({coverage:.1f}%) in {args.preprocess_dir}")
+        if cache_hits != len(nifti_files) and not args.allow_raw_fallback:
+            missing = [
+                str(vol_path) for vol_path in nifti_files
+                if preprocessed_paths[str(vol_path)] is None
+            ]
+            preview = "\n".join(missing[:10])
+            raise RuntimeError(
+                f"Strict preprocessed mode requires 100% .pt coverage, but found "
+                f"{cache_hits}/{len(nifti_files)}. First missing raw volumes:\n"
+                f"{preview}"
+            )
 
     slice_size = (args.slice_height, args.slice_width)
 
@@ -244,6 +330,7 @@ def main():
             result = precompute_single_volume(
                 str(vol_path), encoder, pooler,
                 args.num_slices, slice_size, device,
+                preprocess_path=preprocessed_paths.get(str(vol_path)),
             )
 
         np.savez_compressed(out_path, **result)
