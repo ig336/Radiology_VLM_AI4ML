@@ -27,9 +27,21 @@ pip install --force-reinstall --no-deps markupsafe==3.0.3
 PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
+if [ ! -d ./precompute_tokens_ff ]; then
+    echo "Missing ./precompute_tokens_ff. Run scripts/precompute.sh before train_vlm.sh."
+    exit 1
+fi
+
+if [ ! -d ./precompute_tokens_valid_ff ]; then
+    echo "Missing ./precompute_tokens_valid_ff. Run scripts/precompute_valid.sh before train_vlm.sh."
+    exit 1
+fi
+
 torchrun --nproc_per_node=4 train_vlm.py \
-    --tokens_dir ./precomputed_tokens \
+    --tokens_dir ./precompute_tokens_ff \
     --data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
+    --val_data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
+    --val_tokens_dir ./precompute_tokens_valid_ff \
     --output_dir ./checkpoints/hyperct_vlm \
     --llm_name meta-llama/Llama-3.1-8B-Instruct \
     --llm_hidden_size 4096 \
@@ -43,8 +55,12 @@ torchrun --nproc_per_node=4 train_vlm.py \
     --lr 2e-5 \
     --epochs 3 \
     --batch_size 4 \
+    --eval_batch_size 4 \
     --grad_accum 2 \
     --max_length 2048 \
     --num_task_tokens 3 \
+    --eval_strategy epoch \
+    --generation_eval_samples 512 \
+    --generation_max_new_tokens 128 \
     --bf16 \
     --attn_implementation flash_attention_2

@@ -9,8 +9,10 @@ Trains a Vision-Language Model using precomputed DINOv3 vision tokens:
 
 Usage:
     torchrun --nproc_per_node=4 train_vlm.py \
-        --tokens_dir ./precomputed_tokens \
+        --tokens_dir ./precompute_tokens_ff \
         --data_json ./train_data.json \
+        --val_data_json ./valid_data.json \
+        --val_tokens_dir ./precompute_tokens_valid_ff \
         --output_dir ./checkpoints \
         --llm_name meta-llama/Llama-3.1-8B-Instruct
 """
@@ -25,6 +27,11 @@ import os
 import json
 import argparse
 import logging
+import inspect
+import math
+import re
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -48,6 +55,138 @@ log = logging.getLogger(__name__)
 IMAGE_TOKEN = "<image>"
 IMAGE_TOKEN_INDEX = -200
 IGNORE_INDEX = -100
+
+
+_PUNCT_RE = re.compile(r"[^a-z0-9\s]")
+_ARTICLES_RE = re.compile(r"\b(a|an|the)\b")
+
+
+TASK_ALIASES = {
+    task: sorted({
+        task.replace("_", " "),
+        task.replace("_", "-"),
+        task,
+    })
+    for task in RADIOLOGICAL_TASKS
+}
+TASK_ALIASES.update({
+    "medical_material": ["medical material", "medical device", "device", "catheter", "tube", "line"],
+    "arterial_wall_calcification": ["arterial wall calcification", "vascular calcification", "aortic calcification"],
+    "coronary_artery_wall_calcification": ["coronary artery wall calcification", "coronary calcification", "coronary artery calcification"],
+    "pericardial_effusion": ["pericardial effusion"],
+    "pleural_effusion": ["pleural effusion"],
+    "cardiomegaly": ["cardiomegaly", "enlarged heart", "cardiac enlargement"],
+    "lymphadenopathy": ["lymphadenopathy", "enlarged lymph node", "enlarged lymph nodes"],
+    "emphysema": ["emphysema", "emphysematous change", "emphysematous changes"],
+    "atelectasis": ["atelectasis", "atelectatic change", "atelectatic changes"],
+    "nodule": ["nodule", "nodules", "pulmonary nodule", "pulmonary nodules"],
+    "opacity": ["opacity", "opacities", "ground glass opacity", "ground-glass opacity"],
+    "fibrosis": ["fibrosis", "fibrotic change", "fibrotic changes"],
+    "mosaic_attenuation": ["mosaic attenuation"],
+    "peribronchial_thickening": ["peribronchial thickening", "bronchial wall thickening"],
+    "consolidation": ["consolidation", "airspace consolidation"],
+    "bronchiectasis": ["bronchiectasis", "bronchiectatic change", "bronchiectatic changes"],
+    "interlobular_septal_thickening": ["interlobular septal thickening", "septal thickening"],
+})
+
+
+def normalize_answer(text: str) -> str:
+    """Normalize generated/reference answers for exact-match style metrics."""
+    text = text.lower()
+    text = _PUNCT_RE.sub(" ", text)
+    text = _ARTICLES_RE.sub(" ", text)
+    return " ".join(text.split())
+
+
+def token_f1(prediction: str, reference: str) -> float:
+    pred_tokens = normalize_answer(prediction).split()
+    ref_tokens = normalize_answer(reference).split()
+    if not pred_tokens and not ref_tokens:
+        return 1.0
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    common = Counter(pred_tokens) & Counter(ref_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(ref_tokens)
+    return 2 * precision * recall / (precision + recall)
+
+
+def classify_yes_no(text: str) -> Optional[int]:
+    """Return 1 for yes/present, 0 for no/absent, None when unclear."""
+    norm = normalize_answer(text)
+    if not norm:
+        return None
+
+    if re.match(r"^(yes|yeah|yep|present|positive)\b", norm):
+        return 1
+    if re.match(r"^(no|nope|negative|absent|none)\b", norm):
+        return 0
+
+    negative_patterns = [
+        r"\bno evidence of\b", r"\bwithout\b", r"\babsent\b",
+        r"\bnegative for\b", r"\bfree of\b", r"\bnot seen\b",
+        r"\bnot present\b", r"\bno\b",
+    ]
+    positive_patterns = [
+        r"\bpresent\b", r"\bpositive for\b", r"\bevidence of\b",
+        r"\bseen\b", r"\bvisualized\b", r"\bthere is\b",
+        r"\bthere are\b", r"\bshows\b", r"\bdemonstrates\b",
+    ]
+    if any(re.search(pattern, norm) for pattern in negative_patterns):
+        return 0
+    if any(re.search(pattern, norm) for pattern in positive_patterns):
+        return 1
+    return None
+
+
+def infer_task_from_text(text: str) -> Optional[str]:
+    norm = normalize_answer(text)
+    for task, aliases in TASK_ALIASES.items():
+        for alias in aliases:
+            alias_norm = normalize_answer(alias)
+            if alias_norm and re.search(rf"\b{re.escape(alias_norm)}\b", norm):
+                return task
+    return None
+
+
+def _is_negated_near(text: str, start: int) -> bool:
+    window = normalize_answer(text[max(0, start - 90):start])
+    return bool(re.search(
+        r"\b(no|without|absent|negative|free of|lack of|lacks|not|denies)\b",
+        window,
+    ))
+
+
+def extract_clinical_labels(text: str) -> Dict[str, int]:
+    """Extract task-level labels from short generated/reference answers."""
+    labels: Dict[str, int] = {}
+    norm = normalize_answer(text)
+    for task, aliases in TASK_ALIASES.items():
+        for alias in aliases:
+            alias_norm = normalize_answer(alias)
+            if not alias_norm:
+                continue
+            match = re.search(rf"\b{re.escape(alias_norm)}\b", norm)
+            if match:
+                labels[task] = 0 if _is_negated_near(norm, match.start()) else 1
+                break
+    return labels
+
+
+def binary_scores(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
+    precision = tp / (tp + fp) if (tp + fp) else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+    accuracy = (tp + tn) / (tp + fp + fn + tn) if (tp + fp + fn + tn) else 0.0
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
 
 
 class VQADataset(Dataset):
@@ -101,10 +240,7 @@ class VQADataset(Dataset):
             f"Tried: {candidates}"
         )
 
-    def __getitem__(self, idx):
-        item = self.data[idx]
-
-        # Load precomputed tokens
+    def _load_vision_tokens(self, item: dict) -> torch.Tensor:
         npz_path = self._resolve_token_path(item["image"])
         npz_data = np.load(npz_path)
         all_tokens = npz_data["tokens"]       # (num_tasks, T_out, 768)
@@ -122,10 +258,9 @@ class VQADataset(Dataset):
         all_tokens_t = torch.from_numpy(
             all_tokens).float()  # (num_tasks, T_out, 768)
         # Weighted sum: (T_out, 768) — each task's tokens weighted by confidence
-        vision_tokens = torch.einsum('t, t n d -> n d', weights, all_tokens_t)
+        return torch.einsum('t, t n d -> n d', weights, all_tokens_t)
 
-        # Build conversation
-        convs = item["conversations"]
+    def _format_training_text(self, convs: List[dict]) -> str:
         text_parts = []
         for conv in convs:
             role = conv["from"]
@@ -137,8 +272,29 @@ class VQADataset(Dataset):
                 text_parts.append(
                     f"<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>")
 
-        full_text = "<|begin_of_text|>" + "".join(text_parts)
+        return "<|begin_of_text|>" + "".join(text_parts)
 
+    def _format_generation_prompt(self, convs: List[dict]) -> Tuple[str, str, str]:
+        """Return prompt, reference answer, and last user question for first answer turn."""
+        text_parts = []
+        last_question = ""
+        for conv in convs:
+            role = conv["from"]
+            content = conv["value"]
+            if role == "human":
+                last_question = content
+                text_parts.append(
+                    f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
+            elif role == "gpt":
+                prompt = (
+                    "<|begin_of_text|>"
+                    + "".join(text_parts)
+                    + "<|start_header_id|>assistant<|end_header_id|>\n\n"
+                )
+                return prompt, content, last_question
+        raise ValueError("No assistant answer found in VQA conversation")
+
+    def _tokenize_with_image(self, full_text: str) -> Tuple[torch.Tensor, torch.Tensor]:
         # Tokenize — split around IMAGE_TOKEN
         chunks = full_text.split(IMAGE_TOKEN)
         input_ids = []
@@ -158,6 +314,30 @@ class VQADataset(Dataset):
         # Filter positions that survived truncation
         image_token_positions = [
             p for p in image_token_positions if p < len(input_ids)]
+        return input_ids, torch.tensor(image_token_positions, dtype=torch.long)
+
+    def build_generation_sample(self, idx: int) -> dict:
+        item = self.data[idx]
+        prompt, reference, question = self._format_generation_prompt(
+            item["conversations"])
+        input_ids, image_positions = self._tokenize_with_image(prompt)
+        return {
+            "id": item.get("id", str(idx)),
+            "image": item.get("image", ""),
+            "question": question,
+            "reference": reference,
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "vision_tokens": self._load_vision_tokens(item),
+            "image_positions": image_positions,
+        }
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+
+        vision_tokens = self._load_vision_tokens(item)
+        full_text = self._format_training_text(item["conversations"])
+        input_ids, image_positions = self._tokenize_with_image(full_text)
 
         # Labels: mask everything before assistant responses
         labels = input_ids.clone()
@@ -189,7 +369,7 @@ class VQADataset(Dataset):
             "input_ids": input_ids,
             "labels": labels,
             "vision_tokens": vision_tokens,
-            "image_positions": torch.tensor(image_token_positions, dtype=torch.long),
+            "image_positions": image_positions,
         }
 
 
@@ -246,7 +426,14 @@ class HyperCTVLM(nn.Module):
     def gradient_checkpointing_disable(self):
         self.llm.gradient_checkpointing_disable()
 
-    def forward(self, input_ids, labels, attention_mask, vision_tokens, image_positions):
+    def _build_multimodal_inputs(
+        self,
+        input_ids,
+        attention_mask,
+        vision_tokens,
+        image_positions,
+        labels=None,
+    ):
         device = input_ids.device
         B = input_ids.shape[0]
 
@@ -275,12 +462,15 @@ class HyperCTVLM(nn.Module):
                 post_emb = text_embeds[i, pos + 1:]
                 sample_embeds = torch.cat([pre_emb, aligned, post_emb], dim=0)
 
-                # Adjust labels and mask
-                pre_lab = labels[i, :pos]
-                post_lab = labels[i, pos + 1:]
-                vis_lab = torch.full(
-                    (num_vision,), IGNORE_INDEX, device=device, dtype=labels.dtype)
-                sample_labels = torch.cat([pre_lab, vis_lab, post_lab])
+                if labels is not None:
+                    # Adjust labels around the inserted vision features.
+                    pre_lab = labels[i, :pos]
+                    post_lab = labels[i, pos + 1:]
+                    vis_lab = torch.full(
+                        (num_vision,), IGNORE_INDEX, device=device, dtype=labels.dtype)
+                    sample_labels = torch.cat([pre_lab, vis_lab, post_lab])
+                else:
+                    sample_labels = None
 
                 pre_mask = attention_mask[i, :pos]
                 post_mask = attention_mask[i, pos + 1:]
@@ -289,11 +479,12 @@ class HyperCTVLM(nn.Module):
                 sample_mask = torch.cat([pre_mask, vis_mask, post_mask])
             else:
                 sample_embeds = text_embeds[i]
-                sample_labels = labels[i]
+                sample_labels = labels[i] if labels is not None else None
                 sample_mask = attention_mask[i]
 
             new_embeds_list.append(sample_embeds)
-            new_labels_list.append(sample_labels)
+            if sample_labels is not None:
+                new_labels_list.append(sample_labels)
             new_mask_list.append(sample_mask)
 
         # Pad all samples to the same max length after vision injection
@@ -302,16 +493,30 @@ class HyperCTVLM(nn.Module):
 
         padded_embeds = torch.zeros(
             B, max_len, hidden_dim, device=device, dtype=text_embeds.dtype)
-        padded_labels = torch.full(
-            (B, max_len), IGNORE_INDEX, device=device, dtype=labels.dtype)
+        padded_labels = None
+        if labels is not None:
+            padded_labels = torch.full(
+                (B, max_len), IGNORE_INDEX, device=device, dtype=labels.dtype)
         padded_mask = torch.zeros(
             B, max_len, device=device, dtype=attention_mask.dtype)
 
         for i in range(B):
             cur_len = new_embeds_list[i].shape[0]
             padded_embeds[i, :cur_len] = new_embeds_list[i]
-            padded_labels[i, :cur_len] = new_labels_list[i]
+            if padded_labels is not None:
+                padded_labels[i, :cur_len] = new_labels_list[i]
             padded_mask[i, :cur_len] = new_mask_list[i]
+
+        return padded_embeds, padded_mask, padded_labels
+
+    def forward(self, input_ids, labels, attention_mask, vision_tokens, image_positions):
+        padded_embeds, padded_mask, padded_labels = self._build_multimodal_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            vision_tokens=vision_tokens,
+            image_positions=image_positions,
+            labels=labels,
+        )
 
         outputs = self.llm(
             inputs_embeds=padded_embeds,
@@ -319,6 +524,21 @@ class HyperCTVLM(nn.Module):
             attention_mask=padded_mask,
         )
         return outputs
+
+    @torch.no_grad()
+    def generate(self, input_ids, attention_mask, vision_tokens, image_positions, **kwargs):
+        padded_embeds, padded_mask, _ = self._build_multimodal_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            vision_tokens=vision_tokens,
+            image_positions=image_positions,
+            labels=None,
+        )
+        return self.llm.generate(
+            inputs_embeds=padded_embeds,
+            attention_mask=padded_mask,
+            **kwargs,
+        )
 
 
 def find_linear_names(model):
@@ -334,10 +554,211 @@ def find_linear_names(model):
     return sorted(names)
 
 
+class PerplexityTrainer(Trainer):
+    """Trainer that adds eval perplexity next to eval loss."""
+
+    def evaluate(self, *args, **kwargs):
+        metrics = super().evaluate(*args, **kwargs)
+        prefix = kwargs.get("metric_key_prefix", "eval")
+        loss_key = f"{prefix}_loss"
+        if loss_key in metrics:
+            loss = metrics[loss_key]
+            perplexity = math.exp(loss) if math.isfinite(loss) and loss < 20 else float("inf")
+            ppl_key = f"{prefix}_perplexity"
+            metrics[ppl_key] = perplexity
+            self.log({ppl_key: perplexity})
+        return metrics
+
+
+def clean_generated_answer(text: str) -> str:
+    """Strip chat-template control tokens from generated text."""
+    if "<|start_header_id|>assistant<|end_header_id|>" in text:
+        text = text.split("<|start_header_id|>assistant<|end_header_id|>")[-1]
+    if "<|eot_id|>" in text:
+        text = text.split("<|eot_id|>")[0]
+    text = re.sub(r"<\|[^>]+?\|>", " ", text)
+    return " ".join(text.replace("assistant", " ").split())
+
+
+def update_binary_counts(counts: Dict[str, int], y_true: int, y_pred: int):
+    if y_true == 1 and y_pred == 1:
+        counts["tp"] += 1
+    elif y_true == 0 and y_pred == 1:
+        counts["fp"] += 1
+    elif y_true == 1 and y_pred == 0:
+        counts["fn"] += 1
+    else:
+        counts["tn"] += 1
+
+
+def evaluate_generation(
+    model: HyperCTVLM,
+    dataset: VQADataset,
+    tokenizer,
+    output_dir: str,
+    max_samples: int,
+    max_new_tokens: int,
+    num_beams: int,
+) -> Dict[str, float]:
+    """Generate answers on held-out VQA and compute answer/clinical metrics."""
+    if max_samples == 0:
+        return {}
+
+    sample_count = len(dataset) if max_samples < 0 else min(max_samples, len(dataset))
+    if sample_count == 0:
+        return {}
+
+    os.makedirs(output_dir, exist_ok=True)
+    predictions_path = os.path.join(output_dir, "vlm_generation_eval_predictions.jsonl")
+    metrics_path = os.path.join(output_dir, "vlm_generation_eval_metrics.json")
+
+    device = next(model.parameters()).device
+    model.eval()
+    eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    if eot_token_id is None or eot_token_id == tokenizer.unk_token_id:
+        eot_token_id = tokenizer.eos_token_id
+
+    exact = 0
+    f1_sum = 0.0
+    yes_no_total = 0
+    yes_no_correct = 0
+    yes_no_parseable = 0
+    yes_no_counts = defaultdict(int)
+    clinical_total = 0
+    clinical_correct = 0
+    clinical_counts = defaultdict(int)
+    clinical_task_counts = defaultdict(lambda: defaultdict(int))
+
+    with open(predictions_path, "w") as pred_file:
+        for idx in range(sample_count):
+            sample = dataset.build_generation_sample(idx)
+            input_ids = sample["input_ids"].unsqueeze(0).to(device)
+            attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
+            vision_tokens = [sample["vision_tokens"].to(device)]
+            image_positions = [sample["image_positions"].to(device)]
+
+            generated = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                vision_tokens=vision_tokens,
+                image_positions=image_positions,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=num_beams,
+                eos_token_id=eot_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+
+            raw_prediction = tokenizer.decode(
+                generated[0], skip_special_tokens=False)
+            prediction = clean_generated_answer(raw_prediction)
+            reference = sample["reference"]
+            question = sample["question"]
+
+            norm_pred = normalize_answer(prediction)
+            norm_ref = normalize_answer(reference)
+            exact += int(norm_pred == norm_ref)
+            f1_sum += token_f1(prediction, reference)
+
+            ref_yn = classify_yes_no(reference)
+            pred_yn = classify_yes_no(prediction)
+            if ref_yn is not None:
+                yes_no_total += 1
+                if pred_yn is not None:
+                    yes_no_parseable += 1
+                yes_no_correct += int(pred_yn == ref_yn)
+                update_binary_counts(
+                    yes_no_counts,
+                    ref_yn,
+                    pred_yn if pred_yn is not None else 0,
+                )
+
+            question_task = infer_task_from_text(question)
+            true_labels = extract_clinical_labels(reference)
+            pred_labels = extract_clinical_labels(prediction)
+            if question_task is not None and ref_yn is not None:
+                true_labels.setdefault(question_task, ref_yn)
+                if pred_yn is not None:
+                    pred_labels.setdefault(question_task, pred_yn)
+
+            for task, y_true in true_labels.items():
+                y_pred = pred_labels.get(task, 0)
+                clinical_total += 1
+                clinical_correct += int(y_true == y_pred)
+                update_binary_counts(clinical_counts, y_true, y_pred)
+                update_binary_counts(clinical_task_counts[task], y_true, y_pred)
+
+            pred_file.write(json.dumps({
+                "id": sample["id"],
+                "image": sample["image"],
+                "question": question,
+                "reference": reference,
+                "prediction": prediction,
+            }) + "\n")
+
+            if (idx + 1) % 50 == 0:
+                log.info(f"Generation eval: {idx + 1}/{sample_count} samples")
+
+    yes_no_scores = binary_scores(
+        yes_no_counts["tp"], yes_no_counts["fp"],
+        yes_no_counts["fn"], yes_no_counts["tn"],
+    )
+    clinical_scores = binary_scores(
+        clinical_counts["tp"], clinical_counts["fp"],
+        clinical_counts["fn"], clinical_counts["tn"],
+    )
+    task_f1s = []
+    for task_counts in clinical_task_counts.values():
+        task_scores = binary_scores(
+            task_counts["tp"], task_counts["fp"],
+            task_counts["fn"], task_counts["tn"],
+        )
+        task_f1s.append(task_scores["f1"])
+
+    metrics = {
+        "generation_samples": sample_count,
+        "generation_exact_match": exact / sample_count,
+        "generation_token_f1": f1_sum / sample_count,
+        "generation_yes_no_count": yes_no_total,
+        "generation_yes_no_accuracy": yes_no_correct / yes_no_total if yes_no_total else 0.0,
+        "generation_yes_no_parse_rate": yes_no_parseable / yes_no_total if yes_no_total else 0.0,
+        "generation_yes_no_f1": yes_no_scores["f1"],
+        "generation_clinical_label_count": clinical_total,
+        "generation_clinical_label_accuracy": clinical_correct / clinical_total if clinical_total else 0.0,
+        "generation_clinical_micro_f1": clinical_scores["f1"],
+        "generation_clinical_macro_f1": sum(task_f1s) / len(task_f1s) if task_f1s else 0.0,
+        "generation_clinical_tasks_evaluated": len(task_f1s),
+    }
+
+    with open(metrics_path, "w") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
+
+    log.info(f"Saved generation predictions to {predictions_path}")
+    log.info(f"Saved generation metrics to {metrics_path}")
+    for key, value in metrics.items():
+        log.info(f"Generation metric | {key}: {value}")
+    return metrics
+
+
+def make_training_args(**kwargs) -> TrainingArguments:
+    """Keep compatibility with old/new Transformers argument names."""
+    params = inspect.signature(TrainingArguments.__init__).parameters
+    if "eval_strategy" in params and "evaluation_strategy" in kwargs:
+        kwargs["eval_strategy"] = kwargs.pop("evaluation_strategy")
+    elif "evaluation_strategy" in params and "eval_strategy" in kwargs:
+        kwargs["evaluation_strategy"] = kwargs.pop("eval_strategy")
+    kwargs = {key: value for key, value in kwargs.items() if key in params}
+    return TrainingArguments(**kwargs)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train HyperCT VLM")
     parser.add_argument("--tokens_dir", type=str, required=True)
     parser.add_argument("--data_json", type=str, required=True)
+    parser.add_argument("--val_data_json", type=str, default=None,
+                        help="Optional validation VQA JSON for held-out loss/generation metrics")
+    parser.add_argument("--val_tokens_dir", type=str, default=None,
+                        help="Optional validation token directory; defaults to --tokens_dir")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/vlm")
     parser.add_argument("--llm_name", type=str,
                         default="meta-llama/Llama-3.1-8B-Instruct")
@@ -352,6 +773,7 @@ def main():
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--grad_accum", type=int, default=8)
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--num_task_tokens", type=int, default=3,
@@ -359,6 +781,13 @@ def main():
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
+    parser.add_argument("--eval_strategy", type=str, default="epoch",
+                        choices=["no", "steps", "epoch"])
+    parser.add_argument("--eval_steps", type=int, default=None)
+    parser.add_argument("--generation_eval_samples", type=int, default=256,
+                        help="Validation samples for generated-answer metrics; 0 disables, -1 uses all")
+    parser.add_argument("--generation_max_new_tokens", type=int, default=128)
+    parser.add_argument("--generation_num_beams", type=int, default=1)
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2",
                         choices=["eager", "flash_attention_2", "sdpa"])
     args = parser.parse_args()
@@ -410,11 +839,27 @@ def main():
                          num_task_tokens=args.num_task_tokens)
     log.info(f"Dataset: {len(dataset)} samples")
 
+    eval_dataset = None
+    if args.val_data_json:
+        val_tokens_dir = args.val_tokens_dir or args.tokens_dir
+        eval_dataset = VQADataset(
+            args.val_data_json,
+            val_tokens_dir,
+            tokenizer,
+            args.max_length,
+            num_task_tokens=args.num_task_tokens,
+        )
+        log.info(
+            f"Validation dataset: {len(eval_dataset)} samples | tokens={val_tokens_dir}")
+
     # Training args
-    training_args = TrainingArguments(
+    eval_strategy = args.eval_strategy if eval_dataset is not None else "no"
+    eval_batch_size = args.eval_batch_size or args.batch_size
+    training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
         per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
         bf16=args.bf16,
@@ -426,28 +871,58 @@ def main():
         deepspeed=args.deepspeed,
         report_to="none",
         gradient_checkpointing=True,
+        eval_strategy=eval_strategy,
+        prediction_loss_only=True,
     )
+    if eval_strategy == "steps" and args.eval_steps is not None:
+        training_kwargs["eval_steps"] = args.eval_steps
+    training_args = make_training_args(**training_kwargs)
 
     # Combine Q-Former + LLM into single model
     model = HyperCTVLM(llm, qformer)
 
-    trainer = Trainer(
+    trainer = PerplexityTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         data_collator=lambda batch: collate_fn(batch, tokenizer.pad_token_id),
     )
 
     trainer.train()
 
-    # Save Q-Former separately
-    qformer_path = os.path.join(args.output_dir, "qformer_final.pt")
-    torch.save(qformer.state_dict(), qformer_path)
-    log.info(f"Saved Q-Former to {qformer_path}")
+    if eval_dataset is not None:
+        final_metrics = trainer.evaluate(metric_key_prefix="final_eval")
+        if trainer.is_world_process_zero():
+            log.info(f"Final validation metrics: {final_metrics}")
 
-    # Save LoRA adapter
-    llm.save_pretrained(os.path.join(args.output_dir, "llm_lora"))
-    log.info("Training complete.")
+    if (
+        eval_dataset is not None
+        and args.generation_eval_samples != 0
+        and trainer.is_world_process_zero()
+    ):
+        eval_model = trainer.model
+        if hasattr(eval_model, "module"):
+            eval_model = eval_model.module
+        evaluate_generation(
+            model=eval_model,
+            dataset=eval_dataset,
+            tokenizer=tokenizer,
+            output_dir=args.output_dir,
+            max_samples=args.generation_eval_samples,
+            max_new_tokens=args.generation_max_new_tokens,
+            num_beams=args.generation_num_beams,
+        )
+
+    if trainer.is_world_process_zero():
+        # Save Q-Former separately
+        qformer_path = os.path.join(args.output_dir, "qformer_final.pt")
+        torch.save(qformer.state_dict(), qformer_path)
+        log.info(f"Saved Q-Former to {qformer_path}")
+
+        # Save LoRA adapter
+        llm.save_pretrained(os.path.join(args.output_dir, "llm_lora"))
+        log.info("Training complete.")
 
 
 if __name__ == "__main__":
