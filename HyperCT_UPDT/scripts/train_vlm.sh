@@ -16,8 +16,8 @@ conda activate test
 
 # Install dependencies (confirmed working setup)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-pip install einops open_clip_torch timm deepspeed ninja
-pip install flash-attn
+pip uninstall -y deepspeed
+pip install einops open_clip_torch timm ninja
 pip install "transformers>=4.56.0" nibabel tqdm
 pip install "numpy<2"
 pip install --upgrade peft
@@ -62,5 +62,9 @@ torchrun --nproc_per_node=4 train_vlm.py \
     --eval_strategy epoch \
     --generation_eval_samples 512 \
     --generation_max_new_tokens 128 \
+    --llm_score_samples 64 \
+    --green_score_samples 64 \
+    --judge_max_new_tokens 160 \
+    --official_green_samples 0 \
     --bf16 \
-    --attn_implementation flash_attention_2
+    --attn_implementation sdpa

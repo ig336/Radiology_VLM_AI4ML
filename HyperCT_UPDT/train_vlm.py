@@ -114,6 +114,138 @@ def token_f1(prediction: str, reference: str) -> float:
     return 2 * precision * recall / (precision + recall)
 
 
+def metric_tokens(text: str) -> List[str]:
+    return normalize_answer(text).split()
+
+
+def ngram_counts(tokens: List[str], n: int) -> Counter:
+    if len(tokens) < n:
+        return Counter()
+    return Counter(tuple(tokens[i:i + n]) for i in range(len(tokens) - n + 1))
+
+
+def bleu1_score(prediction: str, reference: str) -> float:
+    pred_tokens = metric_tokens(prediction)
+    ref_tokens = metric_tokens(reference)
+    if not pred_tokens:
+        return 0.0
+    pred_counts = Counter(pred_tokens)
+    ref_counts = Counter(ref_tokens)
+    clipped = sum((pred_counts & ref_counts).values())
+    precision = clipped / len(pred_tokens)
+    if not ref_tokens:
+        return 0.0
+    brevity_penalty = 1.0 if len(pred_tokens) > len(ref_tokens) else math.exp(
+        1.0 - len(ref_tokens) / max(len(pred_tokens), 1)
+    )
+    return brevity_penalty * precision
+
+
+def lcs_length(a: List[str], b: List[str]) -> int:
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    for token_a in a:
+        cur = [0]
+        for j, token_b in enumerate(b, start=1):
+            if token_a == token_b:
+                cur.append(prev[j - 1] + 1)
+            else:
+                cur.append(max(prev[j], cur[-1]))
+        prev = cur
+    return prev[-1]
+
+
+def rouge_l_score(prediction: str, reference: str) -> float:
+    pred_tokens = metric_tokens(prediction)
+    ref_tokens = metric_tokens(reference)
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+    lcs = lcs_length(pred_tokens, ref_tokens)
+    precision = lcs / len(pred_tokens)
+    recall = lcs / len(ref_tokens)
+    return 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+
+def meteor_score(prediction: str, reference: str) -> float:
+    pred_tokens = metric_tokens(prediction)
+    ref_tokens = metric_tokens(reference)
+    if not pred_tokens or not ref_tokens:
+        return 0.0
+
+    ref_available = defaultdict(list)
+    for idx, token in enumerate(ref_tokens):
+        ref_available[token].append(idx)
+
+    matches = []
+    used_ref = set()
+    for pred_idx, token in enumerate(pred_tokens):
+        for ref_idx in ref_available.get(token, []):
+            if ref_idx not in used_ref:
+                used_ref.add(ref_idx)
+                matches.append((pred_idx, ref_idx))
+                break
+
+    match_count = len(matches)
+    if match_count == 0:
+        return 0.0
+
+    precision = match_count / len(pred_tokens)
+    recall = match_count / len(ref_tokens)
+    fmean = (10 * precision * recall) / (recall + 9 * precision) if (recall + 9 * precision) else 0.0
+
+    matches.sort()
+    chunks = 1
+    for prev, cur in zip(matches, matches[1:]):
+        if cur[0] != prev[0] + 1 or cur[1] != prev[1] + 1:
+            chunks += 1
+    penalty = 0.5 * (chunks / match_count) ** 3
+    return fmean * (1.0 - penalty)
+
+
+def cider_scores(predictions: List[str], references: List[str]) -> List[float]:
+    """Lightweight CIDEr-style TF-IDF cosine score over 1-4 grams."""
+    if not predictions:
+        return []
+
+    tokenized_refs = [metric_tokens(ref) for ref in references]
+    n_doc = max(len(tokenized_refs), 1)
+    doc_freq = {n: Counter() for n in range(1, 5)}
+    for tokens in tokenized_refs:
+        for n in range(1, 5):
+            doc_freq[n].update(set(ngram_counts(tokens, n).keys()))
+
+    def tfidf_vector(tokens: List[str], n: int) -> Dict[Tuple[str, ...], float]:
+        counts = ngram_counts(tokens, n)
+        total = sum(counts.values())
+        if total == 0:
+            return {}
+        vec = {}
+        for gram, count in counts.items():
+            tf = count / total
+            idf = math.log((n_doc + 1.0) / (doc_freq[n].get(gram, 0) + 1.0))
+            vec[gram] = tf * idf
+        return vec
+
+    def cosine(vec_a: Dict[Tuple[str, ...], float], vec_b: Dict[Tuple[str, ...], float]) -> float:
+        if not vec_a or not vec_b:
+            return 0.0
+        dot = sum(value * vec_b.get(key, 0.0) for key, value in vec_a.items())
+        norm_a = math.sqrt(sum(value * value for value in vec_a.values()))
+        norm_b = math.sqrt(sum(value * value for value in vec_b.values()))
+        return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+    scores = []
+    for pred, ref in zip(predictions, references):
+        pred_tokens = metric_tokens(pred)
+        ref_tokens = metric_tokens(ref)
+        score = 0.0
+        for n in range(1, 5):
+            score += cosine(tfidf_vector(pred_tokens, n), tfidf_vector(ref_tokens, n))
+        scores.append(10.0 * score / 4.0)
+    return scores
+
+
 def classify_yes_no(text: str) -> Optional[int]:
     """Return 1 for yes/present, 0 for no/absent, None when unclear."""
     norm = normalize_answer(text)
@@ -580,6 +712,226 @@ def clean_generated_answer(text: str) -> str:
     return " ".join(text.replace("assistant", " ").split())
 
 
+def extract_first_number(text: str) -> Optional[float]:
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    return float(match.group(0)) if match else None
+
+
+def extract_json_object(text: str) -> Optional[dict]:
+    match = re.search(r"\{.*?\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def build_llama_score_prompt(reference: str, candidate: str) -> str:
+    return (
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        "You are a strict radiology report evaluator. Score the candidate answer "
+        "against the reference answer for clinical correctness. Focus on factual "
+        "medical agreement, not wording. Return only JSON with keys score and explanation. "
+        "score must be a number from 0 to 10, where 10 is clinically identical."
+        "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"Reference answer:\n{reference}\n\n"
+        f"Candidate answer:\n{candidate}\n\n"
+        "Return JSON only."
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
+def build_green_prompt(reference: str, candidate: str) -> str:
+    return (
+        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
+        "Objective: Evaluate the accuracy of a candidate radiology report in comparison "
+        "to a reference radiology report composed by expert radiologists. Count clinically "
+        "significant and clinically insignificant errors. Errors include false findings, "
+        "missing findings, wrong anatomic location, wrong severity, inappropriate comparison, "
+        "or omitted comparison. Focus on clinical findings, not wording. Return only JSON "
+        "with keys significant_errors, insignificant_errors, green_score, and explanation. "
+        "green_score must be from 0 to 1, where 1 means no clinically meaningful error."
+        "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
+        f"Reference report:\n{reference}\n\n"
+        f"Candidate report:\n{candidate}\n\n"
+        "Return JSON only."
+        "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    )
+
+
+@torch.no_grad()
+def generate_text_with_llm(llm, tokenizer, prompt: str, max_new_tokens: int) -> str:
+    device = next(llm.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
+    if eot_token_id is None or eot_token_id == tokenizer.unk_token_id:
+        eot_token_id = tokenizer.eos_token_id
+    generated = llm.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+        eos_token_id=eot_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    new_tokens = generated[0, inputs["input_ids"].shape[1]:]
+    return clean_generated_answer(tokenizer.decode(new_tokens, skip_special_tokens=False))
+
+
+def score_with_llama_judge(
+    llm,
+    tokenizer,
+    records: List[dict],
+    max_samples: int,
+    max_new_tokens: int,
+) -> Dict[str, float]:
+    if max_samples == 0:
+        return {}
+    sample_count = len(records) if max_samples < 0 else min(max_samples, len(records))
+    if sample_count == 0:
+        return {}
+
+    scores = []
+    for idx, record in enumerate(records[:sample_count]):
+        prompt = build_llama_score_prompt(record["reference"], record["prediction"])
+        answer = generate_text_with_llm(llm, tokenizer, prompt, max_new_tokens)
+        parsed = extract_json_object(answer)
+        score = None
+        if parsed is not None:
+            raw_score = parsed.get("score")
+            if isinstance(raw_score, (int, float)):
+                score = float(raw_score)
+        if score is None:
+            score = extract_first_number(answer)
+        if score is not None:
+            score = max(0.0, min(10.0, score))
+            scores.append(score)
+            record["llama_score"] = score
+        record["llama_score_raw"] = answer
+        if (idx + 1) % 25 == 0:
+            log.info(f"Llama judge: {idx + 1}/{sample_count} samples")
+
+    return {
+        "generation_llama_score_count": len(scores),
+        "generation_llama_score_mean": sum(scores) / len(scores) if scores else 0.0,
+    }
+
+
+def score_with_green_style_judge(
+    llm,
+    tokenizer,
+    records: List[dict],
+    max_samples: int,
+    max_new_tokens: int,
+) -> Dict[str, float]:
+    if max_samples == 0:
+        return {}
+    sample_count = len(records) if max_samples < 0 else min(max_samples, len(records))
+    if sample_count == 0:
+        return {}
+
+    green_scores = []
+    sig_errors = []
+    insig_errors = []
+    for idx, record in enumerate(records[:sample_count]):
+        prompt = build_green_prompt(record["reference"], record["prediction"])
+        answer = generate_text_with_llm(llm, tokenizer, prompt, max_new_tokens)
+        parsed = extract_json_object(answer)
+
+        sig = None
+        insig = None
+        score = None
+        if parsed is not None:
+            if isinstance(parsed.get("significant_errors"), (int, float)):
+                sig = float(parsed["significant_errors"])
+            if isinstance(parsed.get("insignificant_errors"), (int, float)):
+                insig = float(parsed["insignificant_errors"])
+            if isinstance(parsed.get("green_score"), (int, float)):
+                score = float(parsed["green_score"])
+
+        if sig is None or insig is None:
+            numbers = re.findall(r"-?\d+(?:\.\d+)?", answer)
+            if sig is None and numbers:
+                sig = float(numbers[0])
+            if insig is None and len(numbers) > 1:
+                insig = float(numbers[1])
+        if score is None and sig is not None:
+            # GREEN is error-count based; this bounded proxy keeps the same
+            # interpretation: 1 is best, more significant errors hurt more.
+            score = 1.0 - 0.25 * max(sig, 0.0) - 0.05 * max(insig or 0.0, 0.0)
+
+        if sig is not None:
+            sig_errors.append(max(0.0, sig))
+            record["green_significant_errors"] = max(0.0, sig)
+        if insig is not None:
+            insig_errors.append(max(0.0, insig))
+            record["green_insignificant_errors"] = max(0.0, insig)
+        if score is not None:
+            score = max(0.0, min(1.0, score))
+            green_scores.append(score)
+            record["green_score"] = score
+        record["green_score_raw"] = answer
+        if (idx + 1) % 25 == 0:
+            log.info(f"GREEN-style judge: {idx + 1}/{sample_count} samples")
+
+    return {
+        "generation_green_count": len(green_scores),
+        "generation_green_score_mean": sum(green_scores) / len(green_scores) if green_scores else 0.0,
+        "generation_green_significant_errors_mean": sum(sig_errors) / len(sig_errors) if sig_errors else 0.0,
+        "generation_green_insignificant_errors_mean": sum(insig_errors) / len(insig_errors) if insig_errors else 0.0,
+    }
+
+
+def score_with_official_green(
+    references: List[str],
+    predictions: List[str],
+    records: List[dict],
+    model_name: str,
+    output_dir: str,
+    max_samples: int,
+) -> Dict[str, float]:
+    if not model_name or max_samples == 0:
+        return {}
+    sample_count = len(records) if max_samples < 0 else min(max_samples, len(records))
+    if sample_count == 0:
+        return {}
+
+    try:
+        from green_score import GREEN
+    except Exception as exc:
+        log.warning(
+            "Official GREEN requested but green_score is unavailable: %s", exc)
+        return {"generation_official_green_count": 0}
+
+    refs = references[:sample_count]
+    hyps = predictions[:sample_count]
+    green_dir = os.path.join(output_dir, "official_green")
+    os.makedirs(green_dir, exist_ok=True)
+
+    try:
+        scorer = GREEN(model_name, output_dir=green_dir)
+        mean, std, green_score_list, summary, result_df = scorer(refs, hyps)
+    except Exception as exc:
+        log.warning("Official GREEN scoring failed: %s", exc)
+        return {"generation_official_green_count": 0}
+
+    for record, score in zip(records[:sample_count], green_score_list):
+        record["official_green_score"] = float(score)
+
+    result_path = os.path.join(green_dir, "official_green_results.csv")
+    try:
+        result_df.to_csv(result_path, index=False)
+    except Exception as exc:
+        log.warning("Could not save official GREEN result dataframe: %s", exc)
+
+    return {
+        "generation_official_green_count": len(green_score_list),
+        "generation_official_green_mean": float(mean),
+        "generation_official_green_std": float(std),
+    }
+
+
 def update_binary_counts(counts: Dict[str, int], y_true: int, y_pred: int):
     if y_true == 1 and y_pred == 1:
         counts["tp"] += 1
@@ -599,6 +951,11 @@ def evaluate_generation(
     max_samples: int,
     max_new_tokens: int,
     num_beams: int,
+    llm_score_samples: int,
+    green_score_samples: int,
+    judge_max_new_tokens: int,
+    official_green_model: str,
+    official_green_samples: int,
 ) -> Dict[str, float]:
     """Generate answers on held-out VQA and compute answer/clinical metrics."""
     if max_samples == 0:
@@ -628,76 +985,80 @@ def evaluate_generation(
     clinical_correct = 0
     clinical_counts = defaultdict(int)
     clinical_task_counts = defaultdict(lambda: defaultdict(int))
+    references = []
+    predictions = []
+    records = []
 
-    with open(predictions_path, "w") as pred_file:
-        for idx in range(sample_count):
-            sample = dataset.build_generation_sample(idx)
-            input_ids = sample["input_ids"].unsqueeze(0).to(device)
-            attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
-            vision_tokens = [sample["vision_tokens"].to(device)]
-            image_positions = [sample["image_positions"].to(device)]
+    for idx in range(sample_count):
+        sample = dataset.build_generation_sample(idx)
+        input_ids = sample["input_ids"].unsqueeze(0).to(device)
+        attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
+        vision_tokens = [sample["vision_tokens"].to(device)]
+        image_positions = [sample["image_positions"].to(device)]
 
-            generated = model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                vision_tokens=vision_tokens,
-                image_positions=image_positions,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                num_beams=num_beams,
-                eos_token_id=eot_token_id,
-                pad_token_id=tokenizer.pad_token_id,
+        generated = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            vision_tokens=vision_tokens,
+            image_positions=image_positions,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            num_beams=num_beams,
+            eos_token_id=eot_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+
+        raw_prediction = tokenizer.decode(
+            generated[0], skip_special_tokens=False)
+        prediction = clean_generated_answer(raw_prediction)
+        reference = sample["reference"]
+        question = sample["question"]
+        references.append(reference)
+        predictions.append(prediction)
+
+        norm_pred = normalize_answer(prediction)
+        norm_ref = normalize_answer(reference)
+        exact += int(norm_pred == norm_ref)
+        f1_sum += token_f1(prediction, reference)
+
+        ref_yn = classify_yes_no(reference)
+        pred_yn = classify_yes_no(prediction)
+        if ref_yn is not None:
+            yes_no_total += 1
+            if pred_yn is not None:
+                yes_no_parseable += 1
+            yes_no_correct += int(pred_yn == ref_yn)
+            update_binary_counts(
+                yes_no_counts,
+                ref_yn,
+                pred_yn if pred_yn is not None else 0,
             )
 
-            raw_prediction = tokenizer.decode(
-                generated[0], skip_special_tokens=False)
-            prediction = clean_generated_answer(raw_prediction)
-            reference = sample["reference"]
-            question = sample["question"]
+        question_task = infer_task_from_text(question)
+        true_labels = extract_clinical_labels(reference)
+        pred_labels = extract_clinical_labels(prediction)
+        if question_task is not None and ref_yn is not None:
+            true_labels.setdefault(question_task, ref_yn)
+            if pred_yn is not None:
+                pred_labels.setdefault(question_task, pred_yn)
 
-            norm_pred = normalize_answer(prediction)
-            norm_ref = normalize_answer(reference)
-            exact += int(norm_pred == norm_ref)
-            f1_sum += token_f1(prediction, reference)
+        for task, y_true in true_labels.items():
+            y_pred = pred_labels.get(task, 0)
+            clinical_total += 1
+            clinical_correct += int(y_true == y_pred)
+            update_binary_counts(clinical_counts, y_true, y_pred)
+            update_binary_counts(clinical_task_counts[task], y_true, y_pred)
 
-            ref_yn = classify_yes_no(reference)
-            pred_yn = classify_yes_no(prediction)
-            if ref_yn is not None:
-                yes_no_total += 1
-                if pred_yn is not None:
-                    yes_no_parseable += 1
-                yes_no_correct += int(pred_yn == ref_yn)
-                update_binary_counts(
-                    yes_no_counts,
-                    ref_yn,
-                    pred_yn if pred_yn is not None else 0,
-                )
+        records.append({
+            "id": sample["id"],
+            "image": sample["image"],
+            "question": question,
+            "reference": reference,
+            "prediction": prediction,
+        })
 
-            question_task = infer_task_from_text(question)
-            true_labels = extract_clinical_labels(reference)
-            pred_labels = extract_clinical_labels(prediction)
-            if question_task is not None and ref_yn is not None:
-                true_labels.setdefault(question_task, ref_yn)
-                if pred_yn is not None:
-                    pred_labels.setdefault(question_task, pred_yn)
-
-            for task, y_true in true_labels.items():
-                y_pred = pred_labels.get(task, 0)
-                clinical_total += 1
-                clinical_correct += int(y_true == y_pred)
-                update_binary_counts(clinical_counts, y_true, y_pred)
-                update_binary_counts(clinical_task_counts[task], y_true, y_pred)
-
-            pred_file.write(json.dumps({
-                "id": sample["id"],
-                "image": sample["image"],
-                "question": question,
-                "reference": reference,
-                "prediction": prediction,
-            }) + "\n")
-
-            if (idx + 1) % 50 == 0:
-                log.info(f"Generation eval: {idx + 1}/{sample_count} samples")
+        if (idx + 1) % 50 == 0:
+            log.info(f"Generation eval: {idx + 1}/{sample_count} samples")
 
     yes_no_scores = binary_scores(
         yes_no_counts["tp"], yes_no_counts["fp"],
@@ -715,10 +1076,22 @@ def evaluate_generation(
         )
         task_f1s.append(task_scores["f1"])
 
+    bleu1_values = [bleu1_score(pred, ref)
+                    for pred, ref in zip(predictions, references)]
+    rouge_l_values = [rouge_l_score(pred, ref)
+                      for pred, ref in zip(predictions, references)]
+    meteor_values = [meteor_score(pred, ref)
+                     for pred, ref in zip(predictions, references)]
+    cider_values = cider_scores(predictions, references)
+
     metrics = {
         "generation_samples": sample_count,
         "generation_exact_match": exact / sample_count,
         "generation_token_f1": f1_sum / sample_count,
+        "generation_bleu1": sum(bleu1_values) / len(bleu1_values) if bleu1_values else 0.0,
+        "generation_meteor": sum(meteor_values) / len(meteor_values) if meteor_values else 0.0,
+        "generation_rouge_l": sum(rouge_l_values) / len(rouge_l_values) if rouge_l_values else 0.0,
+        "generation_cider": sum(cider_values) / len(cider_values) if cider_values else 0.0,
         "generation_yes_no_count": yes_no_total,
         "generation_yes_no_accuracy": yes_no_correct / yes_no_total if yes_no_total else 0.0,
         "generation_yes_no_parse_rate": yes_no_parseable / yes_no_total if yes_no_total else 0.0,
@@ -729,6 +1102,21 @@ def evaluate_generation(
         "generation_clinical_macro_f1": sum(task_f1s) / len(task_f1s) if task_f1s else 0.0,
         "generation_clinical_tasks_evaluated": len(task_f1s),
     }
+
+    if llm_score_samples != 0:
+        metrics.update(score_with_llama_judge(
+            model.llm, tokenizer, records, llm_score_samples, judge_max_new_tokens))
+    if green_score_samples != 0:
+        metrics.update(score_with_green_style_judge(
+            model.llm, tokenizer, records, green_score_samples, judge_max_new_tokens))
+    if official_green_model and official_green_samples != 0:
+        metrics.update(score_with_official_green(
+            references, predictions, records, official_green_model,
+            output_dir, official_green_samples))
+
+    with open(predictions_path, "w") as pred_file:
+        for record in records:
+            pred_file.write(json.dumps(record) + "\n")
 
     with open(metrics_path, "w") as f:
         json.dump(metrics, f, indent=2, sort_keys=True)
@@ -788,7 +1176,16 @@ def main():
                         help="Validation samples for generated-answer metrics; 0 disables, -1 uses all")
     parser.add_argument("--generation_max_new_tokens", type=int, default=128)
     parser.add_argument("--generation_num_beams", type=int, default=1)
-    parser.add_argument("--attn_implementation", type=str, default="flash_attention_2",
+    parser.add_argument("--llm_score_samples", type=int, default=64,
+                        help="Samples scored by the Llama-as-judge evaluator; 0 disables")
+    parser.add_argument("--green_score_samples", type=int, default=64,
+                        help="Samples scored by the GREEN-style radiology error judge; 0 disables")
+    parser.add_argument("--judge_max_new_tokens", type=int, default=160)
+    parser.add_argument("--official_green_model", type=str, default="",
+                        help="Optional official green_score model, e.g. StanfordAIMI/GREEN-radllama2-7b")
+    parser.add_argument("--official_green_samples", type=int, default=0,
+                        help="Samples scored by official green_score package; 0 disables")
+    parser.add_argument("--attn_implementation", type=str, default="sdpa",
                         choices=["eager", "flash_attention_2", "sdpa"])
     args = parser.parse_args()
 
@@ -912,6 +1309,11 @@ def main():
             max_samples=args.generation_eval_samples,
             max_new_tokens=args.generation_max_new_tokens,
             num_beams=args.generation_num_beams,
+            llm_score_samples=args.llm_score_samples,
+            green_score_samples=args.green_score_samples,
+            judge_max_new_tokens=args.judge_max_new_tokens,
+            official_green_model=args.official_green_model,
+            official_green_samples=args.official_green_samples,
         )
 
     if trainer.is_world_process_zero():
