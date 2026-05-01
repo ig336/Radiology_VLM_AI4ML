@@ -37,7 +37,30 @@ if [ ! -d ./precompute_tokens_valid_ff ]; then
     exit 1
 fi
 
-torchrun --nproc_per_node=4 train_vlm.py \
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
+echo "SLURM_JOB_NODELIST=${SLURM_JOB_NODELIST:-}"
+echo "SLURM_GPUS=${SLURM_GPUS:-}"
+echo "SLURM_GPUS_ON_NODE=${SLURM_GPUS_ON_NODE:-}"
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}"
+nvidia-smi || true
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-}"
+if [ -z "$NPROC_PER_NODE" ]; then
+    NPROC_PER_NODE=$(python - <<'PY'
+import torch
+print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
+PY
+)
+fi
+
+if [ "$NPROC_PER_NODE" -lt 1 ]; then
+    echo "No CUDA devices visible to the job. Check SLURM GPU allocation."
+    exit 1
+fi
+
+echo "Launching train_vlm.py with NPROC_PER_NODE=${NPROC_PER_NODE}"
+
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" train_vlm.py \
     --tokens_dir ./precompute_tokens_ff \
     --data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \

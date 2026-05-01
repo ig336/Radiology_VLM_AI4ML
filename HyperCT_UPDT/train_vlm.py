@@ -1139,6 +1139,31 @@ def make_training_args(**kwargs) -> TrainingArguments:
     return TrainingArguments(**kwargs)
 
 
+def configure_torchrun_device():
+    """Pin each torchrun worker to its LOCAL_RANK GPU before DDP setup."""
+    if not torch.cuda.is_available():
+        return
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+    if local_rank < 0:
+        return
+
+    device_count = torch.cuda.device_count()
+    if local_rank >= device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} but only {device_count} CUDA device(s) "
+            f"are visible. CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}. "
+            "Launch with --nproc_per_node equal to the visible GPU count."
+        )
+
+    torch.cuda.set_device(local_rank)
+    log.info(
+        f"Distributed worker pinned to cuda:{local_rank} "
+        f"(visible_gpus={device_count}, CUDA_VISIBLE_DEVICES="
+        f"{os.environ.get('CUDA_VISIBLE_DEVICES')!r})"
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train HyperCT VLM")
     parser.add_argument("--tokens_dir", type=str, required=True)
@@ -1188,6 +1213,8 @@ def main():
     parser.add_argument("--attn_implementation", type=str, default="sdpa",
                         choices=["eager", "flash_attention_2", "sdpa"])
     args = parser.parse_args()
+
+    configure_torchrun_device()
 
     # Tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
