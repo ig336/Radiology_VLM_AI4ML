@@ -339,11 +339,54 @@ class VQADataset(Dataset):
     def __init__(self, data_json: str, tokens_dir: str, tokenizer,
                  max_length: int = 2048, num_task_tokens: int = 3):
         with open(data_json, "r") as f:
-            self.data = json.load(f)
+            raw_data = json.load(f)
         self.tokens_dir = tokens_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.num_task_tokens = num_task_tokens
+        self._token_stems = self._discover_token_stems(tokens_dir)
+        self._token_path_cache: Dict[str, str] = {}
+
+        self.data = []
+        missing_image = 0
+        missing_tokens = 0
+        missing_conversations = 0
+        for item in raw_data:
+            if not isinstance(item, dict):
+                missing_image += 1
+                continue
+            convs = item.get("conversations")
+            if not isinstance(convs, list) or not convs:
+                missing_conversations += 1
+                continue
+
+            image_ref = self._extract_image_ref(item)
+            if image_ref is None:
+                missing_image += 1
+                continue
+            if not self._has_token_file(image_ref):
+                missing_tokens += 1
+                continue
+
+            normalized = dict(item)
+            normalized["_image_ref"] = image_ref
+            self.data.append(normalized)
+
+        log.info(
+            f"Loaded {len(self.data)}/{len(raw_data)} VQA samples from {data_json} "
+            f"with tokens in {tokens_dir}"
+        )
+        if missing_image or missing_tokens or missing_conversations:
+            log.warning(
+                f"Filtered VQA samples: missing_image={missing_image}, "
+                f"missing_tokens={missing_tokens}, "
+                f"missing_conversations={missing_conversations}"
+            )
+        if not self.data:
+            raise ValueError(
+                f"No usable VQA samples found in {data_json}. Check image keys "
+                f"and token coverage in {tokens_dir}."
+            )
 
         # Llama 3.1 uses <|eot_id|> for end-of-turn, distinct from eos_token_id
         self.eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
@@ -353,19 +396,86 @@ class VQADataset(Dataset):
     def __len__(self):
         return len(self.data)
 
+    @staticmethod
+    def _discover_token_stems(tokens_dir: str) -> set:
+        if not os.path.isdir(tokens_dir):
+            return set()
+        return {
+            os.path.splitext(name)[0]
+            for name in os.listdir(tokens_dir)
+            if name.endswith(".npz")
+        }
+
+    @staticmethod
+    def _token_stem_from_ref(image_ref: str) -> str:
+        base = os.path.basename(str(image_ref).strip())
+        if base.endswith(".nii.gz"):
+            return base[:-7]
+        return os.path.splitext(base)[0]
+
+    @staticmethod
+    def _find_volume_like_string(value) -> Optional[str]:
+        if isinstance(value, str):
+            match = re.search(
+                r"(?:train|valid|validation|test)_\d+_[A-Za-z]_\d+"
+                r"(?:\.nii\.gz|\.npz)?",
+                value,
+            )
+            if match:
+                return match.group(0)
+            if value.endswith((".nii.gz", ".npz")):
+                return value
+        elif isinstance(value, list):
+            for entry in value:
+                found = VQADataset._find_volume_like_string(entry)
+                if found:
+                    return found
+        elif isinstance(value, dict):
+            for entry in value.values():
+                found = VQADataset._find_volume_like_string(entry)
+                if found:
+                    return found
+        return None
+
+    @staticmethod
+    def _extract_image_ref(item: dict) -> Optional[str]:
+        image_keys = (
+            "image", "images", "image_path", "image_name", "filename",
+            "file_name", "volume", "volume_name", "VolumeName", "path",
+            "scan", "scan_id", "ct", "ct_path", "nii", "nii_path",
+        )
+        for key in image_keys:
+            if key in item:
+                found = VQADataset._find_volume_like_string(item[key])
+                if found:
+                    return found
+
+        for key in ("id", "uid", "study_id", "sample_id"):
+            if key in item:
+                found = VQADataset._find_volume_like_string(item[key])
+                if found:
+                    return found
+
+        # Last resort: scan all string/list/dict values. Some VQA exports store
+        # the volume name only inside metadata or IDs rather than an image field.
+        return VQADataset._find_volume_like_string(item)
+
+    def _has_token_file(self, image_ref: str) -> bool:
+        return self._token_stem_from_ref(image_ref) in self._token_stems
+
     def _resolve_token_path(self, image_ref: str) -> str:
+        cached = self._token_path_cache.get(image_ref)
+        if cached is not None:
+            return cached
+
         candidates = []
         candidates.append(os.path.join(self.tokens_dir, image_ref))
-
-        base = os.path.basename(image_ref)
-        if base.endswith(".nii.gz"):
-            base = base[:-7]
-        else:
-            base = os.path.splitext(base)[0]
-        candidates.append(os.path.join(self.tokens_dir, f"{base}.npz"))
+        stem = self._token_stem_from_ref(image_ref)
+        candidates.append(os.path.join(self.tokens_dir, f"{stem}.npz"))
 
         for path in candidates:
             if os.path.exists(path):
+                self._token_path_cache[image_ref] = path
                 return path
         raise FileNotFoundError(
             f"Could not find precomputed tokens for image={image_ref!r}. "
@@ -373,34 +483,43 @@ class VQADataset(Dataset):
         )
 
     def _load_vision_tokens(self, item: dict) -> torch.Tensor:
-        npz_path = self._resolve_token_path(item["image"])
+        image_ref = item["_image_ref"]
+        npz_path = self._resolve_token_path(image_ref)
         npz_data = np.load(npz_path)
         all_tokens = npz_data["tokens"]       # (num_tasks, T_out, 768)
         predictions = npz_data["predictions"]  # (num_tasks, num_tasks)
 
         # Select top-k tasks by classifier confidence (diagonal logits)
         # Diagonal[i] = how well task i's LoRA detects task i in this volume
-        diag = np.diag(predictions)
+        diag = np.array(np.diag(predictions), copy=True)
 
         # Soft weighted combination: instead of hard top-k selection (which
         # can propagate errors if the classifier picks wrong tasks), use
         # softmax-weighted sum across ALL tasks. Low-confidence tasks
         # contribute minimally; no hard thresholding risk.
         weights = torch.softmax(torch.from_numpy(diag).float(), dim=0)
-        all_tokens_t = torch.from_numpy(
-            all_tokens).float()  # (num_tasks, T_out, 768)
+        all_tokens_t = torch.from_numpy(np.array(
+            all_tokens, copy=True)).float()  # (num_tasks, T_out, 768)
         # Weighted sum: (T_out, 768) — each task's tokens weighted by confidence
         return torch.einsum('t, t n d -> n d', weights, all_tokens_t)
 
     def _format_training_text(self, convs: List[dict]) -> str:
         text_parts = []
+        has_image_token = any(
+            IMAGE_TOKEN in str(conv.get("value", conv.get("content", "")))
+            for conv in convs
+        )
+        inserted_image_token = has_image_token
         for conv in convs:
-            role = conv["from"]
-            content = conv["value"]
-            if role == "human":
+            role = conv.get("from", conv.get("role", ""))
+            content = conv.get("value", conv.get("content", ""))
+            if role in {"human", "user"}:
+                if not inserted_image_token:
+                    content = f"{IMAGE_TOKEN}\n{content}"
+                    inserted_image_token = True
                 text_parts.append(
                     f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
-            elif role == "gpt":
+            elif role in {"gpt", "assistant"}:
                 text_parts.append(
                     f"<|start_header_id|>assistant<|end_header_id|>\n\n{content}<|eot_id|>")
 
@@ -410,14 +529,22 @@ class VQADataset(Dataset):
         """Return prompt, reference answer, and last user question for first answer turn."""
         text_parts = []
         last_question = ""
+        has_image_token = any(
+            IMAGE_TOKEN in str(conv.get("value", conv.get("content", "")))
+            for conv in convs
+        )
+        inserted_image_token = has_image_token
         for conv in convs:
-            role = conv["from"]
-            content = conv["value"]
-            if role == "human":
+            role = conv.get("from", conv.get("role", ""))
+            content = conv.get("value", conv.get("content", ""))
+            if role in {"human", "user"}:
+                if not inserted_image_token:
+                    content = f"{IMAGE_TOKEN}\n{content}"
+                    inserted_image_token = True
                 last_question = content
                 text_parts.append(
                     f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
-            elif role == "gpt":
+            elif role in {"gpt", "assistant"}:
                 prompt = (
                     "<|begin_of_text|>"
                     + "".join(text_parts)
@@ -455,7 +582,7 @@ class VQADataset(Dataset):
         input_ids, image_positions = self._tokenize_with_image(prompt)
         return {
             "id": item.get("id", str(idx)),
-            "image": item.get("image", ""),
+            "image": item["_image_ref"],
             "question": question,
             "reference": reference,
             "input_ids": input_ids,
