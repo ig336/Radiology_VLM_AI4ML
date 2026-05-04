@@ -45,7 +45,7 @@ from transformers import (
     TrainingArguments,
     Trainer,
 )
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 
 
 logging.basicConfig(level=logging.INFO,
@@ -68,6 +68,40 @@ TASK_ALIASES = {
         task,
     })
     for task in RADIOLOGICAL_TASKS
+}
+
+QUESTION_TYPES = (
+    "long_answer",
+    "short_answer",
+    "multiple_choice",
+    "report_generation",
+)
+
+QUESTION_TYPE_LABELS = {
+    "long_answer": "Long answer",
+    "short_answer": "Short answer",
+    "multiple_choice": "Multiple choice",
+    "report_generation": "Report generation",
+}
+
+TYPE_AWARE_INSTRUCTIONS = {
+    "long_answer": (
+        "Answer as a radiologist using only findings supported by the CT. "
+        "Be complete but do not invent uncertain findings."
+    ),
+    "short_answer": (
+        "Answer concisely in one short phrase or sentence. "
+        "Do not add unsupported findings."
+    ),
+    "multiple_choice": (
+        "Choose the single best option. Start the answer with only the option "
+        "letter, then give at most one short justification."
+    ),
+    "report_generation": (
+        "Generate a concise radiology-style report using only CT-supported "
+        "findings. Separate clear findings from uncertainty and do not invent "
+        "abnormalities, locations, comparisons, or severity."
+    ),
 }
 TASK_ALIASES.update({
     "medical_material": ["medical material", "medical device", "device", "catheter", "tube", "line"],
@@ -308,6 +342,134 @@ def extract_clinical_labels(text: str) -> Dict[str, int]:
     return labels
 
 
+def normalize_question_type(raw: object) -> Optional[str]:
+    if raw is None:
+        return None
+    text = normalize_answer(str(raw))
+    if not text:
+        return None
+    if "multiple" in text or "mcq" in text or "choice" in text:
+        return "multiple_choice"
+    if "report" in text or "impression" in text:
+        return "report_generation"
+    if "short" in text or "yes no" in text or "yes/no" in str(raw).lower():
+        return "short_answer"
+    if "long" in text or "conversation" in text or "description" in text or "free response" in text:
+        return "long_answer"
+    return None
+
+
+def infer_question_type(item: dict, question: str) -> str:
+    """Infer CT-CHAT-style question type without inspecting the reference answer."""
+    metadata_keys = (
+        "question_type", "type", "category", "task_type", "answer_type",
+        "qa_type", "source", "subset",
+    )
+    for key in metadata_keys:
+        qtype = normalize_question_type(item.get(key))
+        if qtype:
+            return qtype
+
+    for container_key in ("metadata", "meta"):
+        metadata = item.get(container_key)
+        if isinstance(metadata, dict):
+            for key in metadata_keys:
+                qtype = normalize_question_type(metadata.get(key))
+                if qtype:
+                    return qtype
+
+    q = question.lower()
+    q_norm = normalize_answer(question)
+    if re.search(r"\b(a|b|c|d)[\)\.:]\s", q) or "which of the following" in q or "options:" in q:
+        return "multiple_choice"
+    if "report" in q or "impression" in q or "findings section" in q:
+        return "report_generation"
+    if re.match(
+        r"^\s*(is|are|was|were|do|does|did|has|have|had|can|could|should)\b",
+        q,
+    ) or re.search(r"\b(is there|are there|present or absent|yes or no)\b", q):
+        return "short_answer"
+    if len(q_norm.split()) <= 12:
+        return "short_answer"
+    return "long_answer"
+
+
+def is_yes_no_question(question: str) -> bool:
+    q = question.lower()
+    return bool(
+        re.match(
+            r"^\s*(is|are|was|were|do|does|did|has|have|had|can|could|should)\b",
+            q,
+        )
+        or re.search(r"\b(is there|are there|present or absent|yes or no)\b", q)
+    )
+
+
+def add_type_instruction(content: str, question_type: str) -> str:
+    if question_type == "short_answer" and is_yes_no_question(content):
+        instruction = (
+            "Answer with exactly Yes or No. Do not add unsupported findings or "
+            "extra explanation."
+        )
+    else:
+        instruction = TYPE_AWARE_INSTRUCTIONS.get(question_type)
+    if not instruction:
+        return content
+    if "Answering constraint:" in content:
+        return content
+    return f"{content}\n\nAnswering constraint: {instruction}"
+
+
+def generation_limit_for_type(question_type: str, default_limit: int) -> int:
+    if question_type == "multiple_choice":
+        return min(default_limit, 24)
+    if question_type == "short_answer":
+        return min(default_limit, 32)
+    return default_limit
+
+
+def group_indices_by_type(records: List[dict]) -> Dict[str, List[int]]:
+    groups: Dict[str, List[int]] = {qtype: [] for qtype in QUESTION_TYPES}
+    for idx, record in enumerate(records):
+        qtype = record.get("question_type", "long_answer")
+        groups.setdefault(qtype, []).append(idx)
+    return groups
+
+
+def add_type_metrics(metrics: Dict[str, float], records: List[dict],
+                     predictions: List[str], references: List[str]) -> None:
+    for qtype, indices in group_indices_by_type(records).items():
+        if not indices:
+            continue
+        pred_subset = [predictions[i] for i in indices]
+        ref_subset = [references[i] for i in indices]
+        prefix = f"generation_{qtype}"
+        exact = sum(
+            int(normalize_answer(pred) == normalize_answer(ref))
+            for pred, ref in zip(pred_subset, ref_subset)
+        )
+        token_f1_values = [
+            token_f1(pred, ref) for pred, ref in zip(pred_subset, ref_subset)
+        ]
+        bleu_values = [
+            bleu1_score(pred, ref) for pred, ref in zip(pred_subset, ref_subset)
+        ]
+        meteor_values = [
+            meteor_score(pred, ref) for pred, ref in zip(pred_subset, ref_subset)
+        ]
+        rouge_values = [
+            rouge_l_score(pred, ref) for pred, ref in zip(pred_subset, ref_subset)
+        ]
+        cider_values = cider_scores(pred_subset, ref_subset)
+        metrics[f"{prefix}_samples"] = len(indices)
+        metrics[f"{prefix}_exact_match"] = exact / len(indices)
+        metrics[f"{prefix}_token_f1"] = sum(token_f1_values) / len(token_f1_values)
+        metrics[f"{prefix}_bleu1"] = sum(bleu_values) / len(bleu_values)
+        metrics[f"{prefix}_meteor"] = sum(meteor_values) / len(meteor_values)
+        metrics[f"{prefix}_rouge_l"] = sum(rouge_values) / len(rouge_values)
+        metrics[f"{prefix}_cider"] = sum(cider_values) / len(cider_values) if cider_values else 0.0
+
+
 def binary_scores(tp: int, fp: int, fn: int, tn: int) -> Dict[str, float]:
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
@@ -337,13 +499,15 @@ class VQADataset(Dataset):
     """
 
     def __init__(self, data_json: str, tokens_dir: str, tokenizer,
-                 max_length: int = 2048, num_task_tokens: int = 3):
+                 max_length: int = 2048, num_task_tokens: int = 3,
+                 type_aware_prompts: bool = False):
         with open(data_json, "r") as f:
             raw_data = json.load(f)
         self.tokens_dir = tokens_dir
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.num_task_tokens = num_task_tokens
+        self.type_aware_prompts = type_aware_prompts
         self._token_stems = self._discover_token_stems(tokens_dir)
         self._token_path_cache: Dict[str, str] = {}
 
@@ -503,7 +667,8 @@ class VQADataset(Dataset):
         # Weighted sum: (T_out, 768) — each task's tokens weighted by confidence
         return torch.einsum('t, t n d -> n d', weights, all_tokens_t)
 
-    def _format_training_text(self, convs: List[dict]) -> str:
+    def _format_training_text(self, item: dict) -> str:
+        convs = item["conversations"]
         text_parts = []
         has_image_token = any(
             IMAGE_TOKEN in str(conv.get("value", conv.get("content", "")))
@@ -517,6 +682,9 @@ class VQADataset(Dataset):
                 if not inserted_image_token:
                     content = f"{IMAGE_TOKEN}\n{content}"
                     inserted_image_token = True
+                if self.type_aware_prompts:
+                    qtype = infer_question_type(item, content)
+                    content = add_type_instruction(content, qtype)
                 text_parts.append(
                     f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
             elif role in {"gpt", "assistant"}:
@@ -525,10 +693,12 @@ class VQADataset(Dataset):
 
         return "<|begin_of_text|>" + "".join(text_parts)
 
-    def _format_generation_prompt(self, convs: List[dict]) -> Tuple[str, str, str]:
-        """Return prompt, reference answer, and last user question for first answer turn."""
+    def _format_generation_prompt(self, item: dict) -> Tuple[str, str, str, str]:
+        """Return prompt, reference answer, last user question, and question type."""
+        convs = item["conversations"]
         text_parts = []
         last_question = ""
+        question_type = "long_answer"
         has_image_token = any(
             IMAGE_TOKEN in str(conv.get("value", conv.get("content", "")))
             for conv in convs
@@ -542,6 +712,9 @@ class VQADataset(Dataset):
                     content = f"{IMAGE_TOKEN}\n{content}"
                     inserted_image_token = True
                 last_question = content
+                question_type = infer_question_type(item, content)
+                if self.type_aware_prompts:
+                    content = add_type_instruction(content, question_type)
                 text_parts.append(
                     f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
             elif role in {"gpt", "assistant"}:
@@ -550,7 +723,7 @@ class VQADataset(Dataset):
                     + "".join(text_parts)
                     + "<|start_header_id|>assistant<|end_header_id|>\n\n"
                 )
-                return prompt, content, last_question
+                return prompt, content, last_question, question_type
         raise ValueError("No assistant answer found in VQA conversation")
 
     def _tokenize_with_image(self, full_text: str) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -577,13 +750,16 @@ class VQADataset(Dataset):
 
     def build_generation_sample(self, idx: int) -> dict:
         item = self.data[idx]
-        prompt, reference, question = self._format_generation_prompt(
-            item["conversations"])
+        prompt, reference, question, question_type = self._format_generation_prompt(
+            item)
         input_ids, image_positions = self._tokenize_with_image(prompt)
         return {
             "id": item.get("id", str(idx)),
             "image": item["_image_ref"],
             "question": question,
+            "question_type": question_type,
+            "question_type_label": QUESTION_TYPE_LABELS.get(question_type, question_type),
+            "is_yes_no_question": is_yes_no_question(question),
             "reference": reference,
             "input_ids": input_ids,
             "attention_mask": torch.ones_like(input_ids),
@@ -595,7 +771,7 @@ class VQADataset(Dataset):
         item = self.data[idx]
 
         vision_tokens = self._load_vision_tokens(item)
-        full_text = self._format_training_text(item["conversations"])
+        full_text = self._format_training_text(item)
         input_ids, image_positions = self._tokenize_with_image(full_text)
 
         # Labels: mask everything before assistant responses
@@ -920,6 +1096,7 @@ def score_with_llama_judge(
         return {}
 
     scores = []
+    type_scores = defaultdict(list)
     for idx, record in enumerate(records[:sample_count]):
         prompt = build_llama_score_prompt(record["reference"], record["prediction"])
         answer = generate_text_with_llm(llm, tokenizer, prompt, max_new_tokens)
@@ -934,15 +1111,21 @@ def score_with_llama_judge(
         if score is not None:
             score = max(0.0, min(10.0, score))
             scores.append(score)
+            type_scores[record.get("question_type", "long_answer")].append(score)
             record["llama_score"] = score
         record["llama_score_raw"] = answer
         if (idx + 1) % 25 == 0:
             log.info(f"Llama judge: {idx + 1}/{sample_count} samples")
 
-    return {
+    metrics = {
         "generation_llama_score_count": len(scores),
         "generation_llama_score_mean": sum(scores) / len(scores) if scores else 0.0,
     }
+    for qtype, values in type_scores.items():
+        if values:
+            metrics[f"generation_{qtype}_llama_score_count"] = len(values)
+            metrics[f"generation_{qtype}_llama_score_mean"] = sum(values) / len(values)
+    return metrics
 
 
 def score_with_green_style_judge(
@@ -961,7 +1144,11 @@ def score_with_green_style_judge(
     green_scores = []
     sig_errors = []
     insig_errors = []
+    type_green_scores = defaultdict(list)
+    type_sig_errors = defaultdict(list)
+    type_insig_errors = defaultdict(list)
     for idx, record in enumerate(records[:sample_count]):
+        qtype = record.get("question_type", "long_answer")
         prompt = build_green_prompt(record["reference"], record["prediction"])
         answer = generate_text_with_llm(llm, tokenizer, prompt, max_new_tokens)
         parsed = extract_json_object(answer)
@@ -990,24 +1177,38 @@ def score_with_green_style_judge(
 
         if sig is not None:
             sig_errors.append(max(0.0, sig))
+            type_sig_errors[qtype].append(max(0.0, sig))
             record["green_significant_errors"] = max(0.0, sig)
         if insig is not None:
             insig_errors.append(max(0.0, insig))
+            type_insig_errors[qtype].append(max(0.0, insig))
             record["green_insignificant_errors"] = max(0.0, insig)
         if score is not None:
             score = max(0.0, min(1.0, score))
             green_scores.append(score)
+            type_green_scores[qtype].append(score)
             record["green_score"] = score
         record["green_score_raw"] = answer
         if (idx + 1) % 25 == 0:
             log.info(f"GREEN-style judge: {idx + 1}/{sample_count} samples")
 
-    return {
+    metrics = {
         "generation_green_count": len(green_scores),
         "generation_green_score_mean": sum(green_scores) / len(green_scores) if green_scores else 0.0,
         "generation_green_significant_errors_mean": sum(sig_errors) / len(sig_errors) if sig_errors else 0.0,
         "generation_green_insignificant_errors_mean": sum(insig_errors) / len(insig_errors) if insig_errors else 0.0,
     }
+    for qtype, values in type_green_scores.items():
+        if values:
+            metrics[f"generation_{qtype}_green_count"] = len(values)
+            metrics[f"generation_{qtype}_green_score_mean"] = sum(values) / len(values)
+    for qtype, values in type_sig_errors.items():
+        if values:
+            metrics[f"generation_{qtype}_green_significant_errors_mean"] = sum(values) / len(values)
+    for qtype, values in type_insig_errors.items():
+        if values:
+            metrics[f"generation_{qtype}_green_insignificant_errors_mean"] = sum(values) / len(values)
+    return metrics
 
 
 def score_with_official_green(
@@ -1052,11 +1253,19 @@ def score_with_official_green(
     except Exception as exc:
         log.warning("Could not save official GREEN result dataframe: %s", exc)
 
-    return {
+    metrics = {
         "generation_official_green_count": len(green_score_list),
         "generation_official_green_mean": float(mean),
         "generation_official_green_std": float(std),
     }
+    type_scores = defaultdict(list)
+    for record, score in zip(records[:sample_count], green_score_list):
+        type_scores[record.get("question_type", "long_answer")].append(float(score))
+    for qtype, values in type_scores.items():
+        if values:
+            metrics[f"generation_{qtype}_official_green_count"] = len(values)
+            metrics[f"generation_{qtype}_official_green_mean"] = sum(values) / len(values)
+    return metrics
 
 
 def update_binary_counts(counts: Dict[str, int], y_true: int, y_pred: int):
@@ -1083,6 +1292,7 @@ def evaluate_generation(
     judge_max_new_tokens: int,
     official_green_model: str,
     official_green_samples: int,
+    constrained_generation: bool,
 ) -> Dict[str, float]:
     """Generate answers on held-out VQA and compute answer/clinical metrics."""
     if max_samples == 0:
@@ -1122,13 +1332,18 @@ def evaluate_generation(
         attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
         vision_tokens = [sample["vision_tokens"].to(device)]
         image_positions = [sample["image_positions"].to(device)]
+        question_type = sample.get("question_type", "long_answer")
+        sample_max_new_tokens = (
+            generation_limit_for_type(question_type, max_new_tokens)
+            if constrained_generation else max_new_tokens
+        )
 
         generated = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             vision_tokens=vision_tokens,
             image_positions=image_positions,
-            max_new_tokens=max_new_tokens,
+            max_new_tokens=sample_max_new_tokens,
             do_sample=False,
             num_beams=num_beams,
             eos_token_id=eot_token_id,
@@ -1180,6 +1395,9 @@ def evaluate_generation(
             "id": sample["id"],
             "image": sample["image"],
             "question": question,
+            "question_type": question_type,
+            "question_type_label": sample.get("question_type_label", question_type),
+            "is_yes_no_question": sample.get("is_yes_no_question", False),
             "reference": reference,
             "prediction": prediction,
         })
@@ -1229,6 +1447,7 @@ def evaluate_generation(
         "generation_clinical_macro_f1": sum(task_f1s) / len(task_f1s) if task_f1s else 0.0,
         "generation_clinical_tasks_evaluated": len(task_f1s),
     }
+    add_type_metrics(metrics, records, predictions, references)
 
     if llm_score_samples != 0:
         metrics.update(score_with_llama_judge(
@@ -1310,6 +1529,8 @@ def main():
     parser.add_argument("--lora_r", type=int, default=128)
     parser.add_argument("--lora_alpha", type=int, default=256)
     parser.add_argument("--lora_dropout", type=float, default=0.05)
+    parser.add_argument("--llm_lora_checkpoint", type=str, default=None,
+                        help="Optional saved PEFT LoRA adapter directory for eval/resume-style loading")
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -1318,9 +1539,15 @@ def main():
     parser.add_argument("--max_length", type=int, default=2048)
     parser.add_argument("--num_task_tokens", type=int, default=3,
                         help="Number of top tasks to select based on classifier confidence")
+    parser.add_argument("--type_aware_prompts", action="store_true",
+                        help="Add question-type instructions for long/short/MCQ/report samples")
+    parser.add_argument("--constrained_generation", action="store_true",
+                        help="Use question-type-specific generation caps for short-answer and MCQ eval")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Skip training and run validation/generation from saved adapters")
     parser.add_argument("--eval_strategy", type=str, default="epoch",
                         choices=["no", "steps", "epoch"])
     parser.add_argument("--eval_steps", type=int, default=None)
@@ -1357,17 +1584,25 @@ def main():
     )
 
     # LoRA on LLM
-    target_modules = find_linear_names(llm)
-    log.info(f"LoRA target modules: {target_modules}")
-    lora_config = LoraConfig(
-        r=args.lora_r,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    llm = get_peft_model(llm, lora_config)
+    if args.llm_lora_checkpoint:
+        log.info(f"Loading LLM LoRA adapter: {args.llm_lora_checkpoint}")
+        llm = PeftModel.from_pretrained(
+            llm,
+            args.llm_lora_checkpoint,
+            is_trainable=not args.eval_only,
+        )
+    else:
+        target_modules = find_linear_names(llm)
+        log.info(f"LoRA target modules: {target_modules}")
+        lora_config = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        llm = get_peft_model(llm, lora_config)
     llm.print_trainable_parameters()
 
     # Q-Former adapter
@@ -1387,7 +1622,8 @@ def main():
 
     # Dataset
     dataset = VQADataset(args.data_json, args.tokens_dir, tokenizer, args.max_length,
-                         num_task_tokens=args.num_task_tokens)
+                         num_task_tokens=args.num_task_tokens,
+                         type_aware_prompts=args.type_aware_prompts)
     log.info(f"Dataset: {len(dataset)} samples")
 
     eval_dataset = None
@@ -1399,6 +1635,7 @@ def main():
             tokenizer,
             args.max_length,
             num_task_tokens=args.num_task_tokens,
+            type_aware_prompts=args.type_aware_prompts,
         )
         log.info(
             f"Validation dataset: {len(eval_dataset)} samples | tokens={val_tokens_dir}")
@@ -1440,7 +1677,10 @@ def main():
         data_collator=lambda batch: collate_fn(batch, tokenizer.pad_token_id),
     )
 
-    trainer.train()
+    if args.eval_only:
+        log.info("eval_only=True: skipping training and running evaluation/generation only.")
+    else:
+        trainer.train()
 
     if eval_dataset is not None:
         final_metrics = trainer.evaluate(metric_key_prefix="final_eval")
@@ -1468,9 +1708,10 @@ def main():
             judge_max_new_tokens=args.judge_max_new_tokens,
             official_green_model=args.official_green_model,
             official_green_samples=args.official_green_samples,
+            constrained_generation=args.constrained_generation,
         )
 
-    if trainer.is_world_process_zero():
+    if trainer.is_world_process_zero() and not args.eval_only:
         # Save Q-Former separately
         qformer_path = os.path.join(args.output_dir, "qformer_final.pt")
         torch.save(qformer.state_dict(), qformer_path)
