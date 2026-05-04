@@ -1,15 +1,17 @@
 #!/bin/bash
-# Evaluate the completed epoch-1 VLM checkpoint with CT-CHAT-style
-# question-type stratification, constrained generation, and official GREEN.
-# This does not retrain and does not overwrite the original epoch-1 checkpoint.
-#SBATCH --job-name=hyperct_eval_vlm_strat_green
+# Continue from the completed epoch-1 VLM checkpoint for one more type-aware
+# epoch. This is the recommended improvement run: it keeps the trained Q-Former
+# and LLM LoRA adapter, then adds type-aware prompts, Stage 1 finding hints, and
+# balanced question-type sampling. Generation is evaluated raw. It saves to a
+# new checkpoint directory.
+#SBATCH --job-name=hyperct_continue_vlm_typeaware
 #SBATCH -p sablab-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=24:00:00
-#SBATCH --output=hyperct_eval_vlm_strat_green_%j.out
-#SBATCH --error=hyperct_eval_vlm_strat_green_%j.err
+#SBATCH --time=48:00:00
+#SBATCH --output=hyperct_continue_vlm_typeaware_%j.out
+#SBATCH --error=hyperct_continue_vlm_typeaware_%j.err
 
 set -euo pipefail
 module purge
@@ -25,20 +27,42 @@ pip install "numpy<2"
 pip install --upgrade peft
 pip install --upgrade pip wheel
 pip install --force-reinstall --no-deps markupsafe==3.0.3
-pip install green_score || pip install green-score || true
 
 PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
-python train_vlm.py \
+if [ ! -f ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt ]; then
+    echo "Missing ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt"
+    exit 1
+fi
+
+if [ ! -d ./checkpoints/hyperct_vlm_epoch1/llm_lora ]; then
+    echo "Missing ./checkpoints/hyperct_vlm_epoch1/llm_lora"
+    exit 1
+fi
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-}"
+if [ -z "$NPROC_PER_NODE" ]; then
+    NPROC_PER_NODE=$(python - <<'PY'
+import torch
+print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
+PY
+)
+fi
+
+if [ "$NPROC_PER_NODE" -lt 1 ]; then
+    echo "No CUDA devices visible to the job. Check SLURM GPU allocation."
+    exit 1
+fi
+
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" train_vlm.py \
     --tokens_dir ./precompute_tokens_ff \
     --data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
     --val_tokens_dir ./precompute_tokens_valid_ff \
-    --output_dir ./checkpoints/hyperct_vlm_epoch1_stratified_green_eval \
+    --output_dir ./checkpoints/hyperct_vlm_epoch1_continue_typeaware \
     --qformer_checkpoint ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt \
     --llm_lora_checkpoint ./checkpoints/hyperct_vlm_epoch1/llm_lora \
-    --eval_only \
     --llm_name meta-llama/Llama-3.1-8B-Instruct \
     --llm_hidden_size 4096 \
     --vision_dim 768 \
@@ -48,6 +72,8 @@ python train_vlm.py \
     --lora_r 128 \
     --lora_alpha 256 \
     --lora_dropout 0.05 \
+    --lr 1e-5 \
+    --epochs 1 \
     --batch_size 4 \
     --eval_batch_size 4 \
     --grad_accum 2 \
@@ -58,11 +84,9 @@ python train_vlm.py \
     --generation_max_new_tokens 128 \
     --generation_num_beams 1 \
     --type_aware_prompts \
-    --constrained_generation \
+    --task_hint_top_k 3 \
+    --balance_question_types \
     --llm_score_samples 64 \
-    --green_score_samples 64 \
-    --official_green_model StanfordAIMI/GREEN-radllama2-7b \
-    --official_green_samples 64 \
     --judge_max_new_tokens 160 \
     --bf16 \
     --attn_implementation sdpa

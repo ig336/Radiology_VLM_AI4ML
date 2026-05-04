@@ -87,20 +87,21 @@ QUESTION_TYPE_LABELS = {
 TYPE_AWARE_INSTRUCTIONS = {
     "long_answer": (
         "Answer as a radiologist using only findings supported by the CT. "
-        "Be complete but do not invent uncertain findings."
+        "Give the relevant positive and negative findings directly. Do not "
+        "invent uncertain findings."
     ),
     "short_answer": (
-        "Answer concisely in one short phrase or sentence. "
-        "Do not add unsupported findings."
+        "Answer concisely in one short phrase or sentence. If the question is "
+        "polar, answer Yes or No first. Do not add unsupported findings."
     ),
     "multiple_choice": (
         "Choose the single best option. Start the answer with only the option "
         "letter, then give at most one short justification."
     ),
     "report_generation": (
-        "Generate a concise radiology-style report using only CT-supported "
-        "findings. Separate clear findings from uncertainty and do not invent "
-        "abnormalities, locations, comparisons, or severity."
+        "Generate a concise radiology-style answer with Findings and Impression. "
+        "Use only CT-supported findings. Do not invent abnormalities, locations, "
+        "comparisons, or severity."
     ),
 }
 TASK_ALIASES.update({
@@ -308,6 +309,54 @@ def classify_yes_no(text: str) -> Optional[int]:
     return None
 
 
+def extract_mcq_options(question: str) -> Dict[str, str]:
+    """Parse option letters and option text from an MCQ prompt when available."""
+    option_pattern = re.compile(
+        r"(?:^|\n|\s)([A-Da-d])[\)\.:]\s*(.*?)(?=(?:\n|\s)[A-Da-d][\)\.:]\s*|$)",
+        re.DOTALL,
+    )
+    options = {}
+    for match in option_pattern.finditer(str(question)):
+        letter = match.group(1).upper()
+        option_text = " ".join(match.group(2).strip().split())
+        if option_text:
+            options[letter] = option_text
+    return options
+
+
+def extract_mcq_option(text: str, question: Optional[str] = None) -> Optional[str]:
+    """Extract an A/B/C/D choice from raw generated/reference text."""
+    raw = str(text).strip()
+    if not raw:
+        return None
+    cleaned = clean_generated_answer(raw)
+    candidates = [raw, cleaned]
+    patterns = (
+        r"^\s*([A-Da-d])\s*$",
+        r"^\s*([A-Da-d])[\)\.:]\s+",
+        r"^\s*(?:answer|option|choice)\s*(?:is|:|-)?\s*([A-Da-d])\b",
+        r"\b(?:answer|option|choice)\s*(?:is|:|-)?\s*([A-Da-d])\b",
+        r"\(([A-Da-d])\)",
+    )
+    for candidate in candidates:
+        for pattern in patterns:
+            match = re.search(pattern, candidate)
+            if match:
+                return match.group(1).upper()
+
+    if question:
+        answer_norm = normalize_answer(cleaned)
+        for letter, option_text in extract_mcq_options(question).items():
+            option_norm = normalize_answer(option_text)
+            if len(option_norm) >= 3 and (
+                answer_norm == option_norm
+                or answer_norm in option_norm
+                or option_norm in answer_norm
+            ):
+                return letter
+    return None
+
+
 def infer_task_from_text(text: str) -> Optional[str]:
     norm = normalize_answer(text)
     for task, aliases in TASK_ALIASES.items():
@@ -359,6 +408,10 @@ def normalize_question_type(raw: object) -> Optional[str]:
     return None
 
 
+def clean_question_text(question: str) -> str:
+    return str(question).replace(IMAGE_TOKEN, " ").strip()
+
+
 def infer_question_type(item: dict, question: str) -> str:
     """Infer CT-CHAT-style question type without inspecting the reference answer."""
     metadata_keys = (
@@ -378,8 +431,9 @@ def infer_question_type(item: dict, question: str) -> str:
                 if qtype:
                     return qtype
 
-    q = question.lower()
-    q_norm = normalize_answer(question)
+    clean_question = clean_question_text(question)
+    q = clean_question.lower()
+    q_norm = normalize_answer(clean_question)
     if re.search(r"\b(a|b|c|d)[\)\.:]\s", q) or "which of the following" in q or "options:" in q:
         return "multiple_choice"
     if "report" in q or "impression" in q or "findings section" in q:
@@ -395,7 +449,7 @@ def infer_question_type(item: dict, question: str) -> str:
 
 
 def is_yes_no_question(question: str) -> bool:
-    q = question.lower()
+    q = clean_question_text(question).lower()
     return bool(
         re.match(
             r"^\s*(is|are|was|were|do|does|did|has|have|had|can|could|should)\b",
@@ -420,12 +474,26 @@ def add_type_instruction(content: str, question_type: str) -> str:
     return f"{content}\n\nAnswering constraint: {instruction}"
 
 
-def generation_limit_for_type(question_type: str, default_limit: int) -> int:
-    if question_type == "multiple_choice":
-        return min(default_limit, 24)
-    if question_type == "short_answer":
-        return min(default_limit, 32)
-    return default_limit
+def sigmoid_np(values: np.ndarray) -> np.ndarray:
+    values = np.clip(values, -30.0, 30.0)
+    return 1.0 / (1.0 + np.exp(-values))
+
+
+def format_task_hint(task_names: List[str]) -> str:
+    if not task_names:
+        return ""
+    readable = ", ".join(task.replace("_", " ") for task in task_names)
+    return (
+        "Stage 1 visual finding hints from the CT classifier: "
+        f"{readable}. Use these only as visual guidance; the final answer must "
+        "still match the question and avoid unsupported findings."
+    )
+
+
+def add_task_hint(content: str, hint: str) -> str:
+    if not hint or "Stage 1 visual finding hints" in content:
+        return content
+    return f"{content}\n\n{hint}"
 
 
 def group_indices_by_type(records: List[dict]) -> Dict[str, List[int]]:
@@ -500,7 +568,9 @@ class VQADataset(Dataset):
 
     def __init__(self, data_json: str, tokens_dir: str, tokenizer,
                  max_length: int = 2048, num_task_tokens: int = 3,
-                 type_aware_prompts: bool = False):
+                 type_aware_prompts: bool = False,
+                 task_hint_top_k: int = 0,
+                 balance_question_types: bool = False):
         with open(data_json, "r") as f:
             raw_data = json.load(f)
         self.tokens_dir = tokens_dir
@@ -508,6 +578,8 @@ class VQADataset(Dataset):
         self.max_length = max_length
         self.num_task_tokens = num_task_tokens
         self.type_aware_prompts = type_aware_prompts
+        self.task_hint_top_k = max(0, task_hint_top_k)
+        self.balance_question_types = balance_question_types
         self._token_stems = self._discover_token_stems(tokens_dir)
         self._token_path_cache: Dict[str, str] = {}
 
@@ -534,6 +606,7 @@ class VQADataset(Dataset):
 
             normalized = dict(item)
             normalized["_image_ref"] = image_ref
+            normalized["_question_type"] = self._infer_item_question_type(normalized)
             self.data.append(normalized)
 
         log.info(
@@ -552,6 +625,11 @@ class VQADataset(Dataset):
                 f"and token coverage in {tokens_dir}."
             )
 
+        self._log_question_type_counts("Question type counts before balancing")
+        if self.balance_question_types:
+            self._balance_question_types()
+            self._log_question_type_counts("Question type counts after balancing")
+
         # Llama 3.1 uses <|eot_id|> for end-of-turn, distinct from eos_token_id
         self.eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
         if self.eot_token_id is None or self.eot_token_id == tokenizer.unk_token_id:
@@ -559,6 +637,45 @@ class VQADataset(Dataset):
 
     def __len__(self):
         return len(self.data)
+
+    @staticmethod
+    def _first_user_question(item: dict) -> str:
+        for conv in item.get("conversations", []):
+            role = conv.get("from", conv.get("role", ""))
+            if role in {"human", "user"}:
+                return conv.get("value", conv.get("content", ""))
+        return ""
+
+    def _infer_item_question_type(self, item: dict) -> str:
+        return infer_question_type(item, self._first_user_question(item))
+
+    def _log_question_type_counts(self, message: str) -> None:
+        counts = Counter(item.get("_question_type", "long_answer") for item in self.data)
+        log.info("%s: %s", message, dict(sorted(counts.items())))
+
+    def _balance_question_types(self) -> None:
+        groups: Dict[str, List[dict]] = defaultdict(list)
+        for item in self.data:
+            groups[item.get("_question_type", "long_answer")].append(item)
+        nonempty = {qtype: items for qtype, items in groups.items() if items}
+        if len(nonempty) <= 1:
+            return
+
+        target = max(len(items) for items in nonempty.values())
+        balanced = []
+        for qtype in QUESTION_TYPES:
+            items = nonempty.get(qtype, [])
+            if not items:
+                continue
+            repeats, remainder = divmod(target, len(items))
+            balanced.extend(items * repeats)
+            balanced.extend(items[:remainder])
+
+        # Preserve any unexpected types without dropping data.
+        for qtype, items in nonempty.items():
+            if qtype not in QUESTION_TYPES:
+                balanced.extend(items)
+        self.data = balanced
 
     @staticmethod
     def _discover_token_stems(tokens_dir: str) -> set:
@@ -667,9 +784,23 @@ class VQADataset(Dataset):
         # Weighted sum: (T_out, 768) — each task's tokens weighted by confidence
         return torch.einsum('t, t n d -> n d', weights, all_tokens_t)
 
+    def _stage1_task_hint(self, item: dict) -> str:
+        if self.task_hint_top_k <= 0:
+            return ""
+        npz_path = self._resolve_token_path(item["_image_ref"])
+        npz_data = np.load(npz_path)
+        predictions = npz_data["predictions"]
+        diag = np.array(np.diag(predictions), copy=True)
+        probs = sigmoid_np(diag)
+        top_k = min(self.task_hint_top_k, len(RADIOLOGICAL_TASKS))
+        top_indices = np.argsort(-probs)[:top_k]
+        task_names = [RADIOLOGICAL_TASKS[int(idx)] for idx in top_indices]
+        return format_task_hint(task_names)
+
     def _format_training_text(self, item: dict) -> str:
         convs = item["conversations"]
         text_parts = []
+        task_hint = self._stage1_task_hint(item)
         has_image_token = any(
             IMAGE_TOKEN in str(conv.get("value", conv.get("content", "")))
             for conv in convs
@@ -683,8 +814,9 @@ class VQADataset(Dataset):
                     content = f"{IMAGE_TOKEN}\n{content}"
                     inserted_image_token = True
                 if self.type_aware_prompts:
-                    qtype = infer_question_type(item, content)
+                    qtype = item.get("_question_type") or infer_question_type(item, content)
                     content = add_type_instruction(content, qtype)
+                content = add_task_hint(content, task_hint)
                 text_parts.append(
                     f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
             elif role in {"gpt", "assistant"}:
@@ -698,7 +830,8 @@ class VQADataset(Dataset):
         convs = item["conversations"]
         text_parts = []
         last_question = ""
-        question_type = "long_answer"
+        question_type = item.get("_question_type", "long_answer")
+        task_hint = self._stage1_task_hint(item)
         has_image_token = any(
             IMAGE_TOKEN in str(conv.get("value", conv.get("content", "")))
             for conv in convs
@@ -712,9 +845,10 @@ class VQADataset(Dataset):
                     content = f"{IMAGE_TOKEN}\n{content}"
                     inserted_image_token = True
                 last_question = content
-                question_type = infer_question_type(item, content)
+                question_type = item.get("_question_type") or infer_question_type(item, content)
                 if self.type_aware_prompts:
                     content = add_type_instruction(content, question_type)
+                content = add_task_hint(content, task_hint)
                 text_parts.append(
                     f"<|start_header_id|>user<|end_header_id|>\n\n{content}<|eot_id|>")
             elif role in {"gpt", "assistant"}:
@@ -1292,7 +1426,6 @@ def evaluate_generation(
     judge_max_new_tokens: int,
     official_green_model: str,
     official_green_samples: int,
-    constrained_generation: bool,
 ) -> Dict[str, float]:
     """Generate answers on held-out VQA and compute answer/clinical metrics."""
     if max_samples == 0:
@@ -1314,10 +1447,15 @@ def evaluate_generation(
 
     exact = 0
     f1_sum = 0.0
+    yes_no_question_total = 0
     yes_no_total = 0
     yes_no_correct = 0
     yes_no_parseable = 0
     yes_no_counts = defaultdict(int)
+    mcq_question_total = 0
+    mcq_ref_parseable = 0
+    mcq_pred_parseable = 0
+    mcq_correct = 0
     clinical_total = 0
     clinical_correct = 0
     clinical_counts = defaultdict(int)
@@ -1333,17 +1471,13 @@ def evaluate_generation(
         vision_tokens = [sample["vision_tokens"].to(device)]
         image_positions = [sample["image_positions"].to(device)]
         question_type = sample.get("question_type", "long_answer")
-        sample_max_new_tokens = (
-            generation_limit_for_type(question_type, max_new_tokens)
-            if constrained_generation else max_new_tokens
-        )
 
         generated = model.generate(
             input_ids=input_ids,
             attention_mask=attention_mask,
             vision_tokens=vision_tokens,
             image_positions=image_positions,
-            max_new_tokens=sample_max_new_tokens,
+            max_new_tokens=max_new_tokens,
             do_sample=False,
             num_beams=num_beams,
             eos_token_id=eot_token_id,
@@ -1355,6 +1489,7 @@ def evaluate_generation(
         prediction = clean_generated_answer(raw_prediction)
         reference = sample["reference"]
         question = sample["question"]
+        is_yes_no_sample = bool(sample.get("is_yes_no_question", False))
         references.append(reference)
         predictions.append(prediction)
 
@@ -1365,16 +1500,30 @@ def evaluate_generation(
 
         ref_yn = classify_yes_no(reference)
         pred_yn = classify_yes_no(prediction)
-        if ref_yn is not None:
-            yes_no_total += 1
-            if pred_yn is not None:
-                yes_no_parseable += 1
-            yes_no_correct += int(pred_yn == ref_yn)
-            update_binary_counts(
-                yes_no_counts,
-                ref_yn,
-                pred_yn if pred_yn is not None else 0,
-            )
+        if is_yes_no_sample:
+            yes_no_question_total += 1
+            if ref_yn is not None:
+                yes_no_total += 1
+                if pred_yn is not None:
+                    yes_no_parseable += 1
+                yes_no_correct += int(pred_yn == ref_yn)
+                update_binary_counts(
+                    yes_no_counts,
+                    ref_yn,
+                    pred_yn if pred_yn is not None else 0,
+                )
+
+        ref_mcq = None
+        pred_mcq = None
+        if question_type == "multiple_choice":
+            mcq_question_total += 1
+            ref_mcq = extract_mcq_option(reference, question)
+            pred_mcq = extract_mcq_option(prediction, question)
+            if ref_mcq is not None:
+                mcq_ref_parseable += 1
+                if pred_mcq is not None:
+                    mcq_pred_parseable += 1
+                mcq_correct += int(pred_mcq == ref_mcq)
 
         question_task = infer_task_from_text(question)
         true_labels = extract_clinical_labels(reference)
@@ -1397,9 +1546,13 @@ def evaluate_generation(
             "question": question,
             "question_type": question_type,
             "question_type_label": sample.get("question_type_label", question_type),
-            "is_yes_no_question": sample.get("is_yes_no_question", False),
+            "is_yes_no_question": is_yes_no_sample,
             "reference": reference,
             "prediction": prediction,
+            "yes_no_reference_label": ref_yn,
+            "yes_no_prediction_label": pred_yn,
+            "mcq_reference_option": ref_mcq,
+            "mcq_prediction_option": pred_mcq,
         })
 
         if (idx + 1) % 50 == 0:
@@ -1437,10 +1590,17 @@ def evaluate_generation(
         "generation_meteor": sum(meteor_values) / len(meteor_values) if meteor_values else 0.0,
         "generation_rouge_l": sum(rouge_l_values) / len(rouge_l_values) if rouge_l_values else 0.0,
         "generation_cider": sum(cider_values) / len(cider_values) if cider_values else 0.0,
+        "generation_yes_no_question_count": yes_no_question_total,
         "generation_yes_no_count": yes_no_total,
+        "generation_yes_no_reference_parse_rate": yes_no_total / yes_no_question_total if yes_no_question_total else 0.0,
         "generation_yes_no_accuracy": yes_no_correct / yes_no_total if yes_no_total else 0.0,
         "generation_yes_no_parse_rate": yes_no_parseable / yes_no_total if yes_no_total else 0.0,
         "generation_yes_no_f1": yes_no_scores["f1"],
+        "generation_mcq_question_count": mcq_question_total,
+        "generation_mcq_classification_count": mcq_ref_parseable,
+        "generation_mcq_reference_parse_rate": mcq_ref_parseable / mcq_question_total if mcq_question_total else 0.0,
+        "generation_mcq_prediction_parse_rate": mcq_pred_parseable / mcq_ref_parseable if mcq_ref_parseable else 0.0,
+        "generation_mcq_classification_accuracy": mcq_correct / mcq_ref_parseable if mcq_ref_parseable else 0.0,
         "generation_clinical_label_count": clinical_total,
         "generation_clinical_label_accuracy": clinical_correct / clinical_total if clinical_total else 0.0,
         "generation_clinical_micro_f1": clinical_scores["f1"],
@@ -1541,8 +1701,10 @@ def main():
                         help="Number of top tasks to select based on classifier confidence")
     parser.add_argument("--type_aware_prompts", action="store_true",
                         help="Add question-type instructions for long/short/MCQ/report samples")
-    parser.add_argument("--constrained_generation", action="store_true",
-                        help="Use question-type-specific generation caps for short-answer and MCQ eval")
+    parser.add_argument("--task_hint_top_k", type=int, default=0,
+                        help="Add top-k Stage 1 classifier finding hints to VQA prompts")
+    parser.add_argument("--balance_question_types", action="store_true",
+                        help="Oversample minority question types in the training dataset")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
@@ -1557,7 +1719,7 @@ def main():
     parser.add_argument("--generation_num_beams", type=int, default=1)
     parser.add_argument("--llm_score_samples", type=int, default=64,
                         help="Samples scored by the Llama-as-judge evaluator; 0 disables")
-    parser.add_argument("--green_score_samples", type=int, default=64,
+    parser.add_argument("--green_score_samples", type=int, default=0,
                         help="Samples scored by the GREEN-style radiology error judge; 0 disables")
     parser.add_argument("--judge_max_new_tokens", type=int, default=160)
     parser.add_argument("--official_green_model", type=str, default="",
@@ -1623,7 +1785,9 @@ def main():
     # Dataset
     dataset = VQADataset(args.data_json, args.tokens_dir, tokenizer, args.max_length,
                          num_task_tokens=args.num_task_tokens,
-                         type_aware_prompts=args.type_aware_prompts)
+                         type_aware_prompts=args.type_aware_prompts,
+                         task_hint_top_k=args.task_hint_top_k,
+                         balance_question_types=args.balance_question_types)
     log.info(f"Dataset: {len(dataset)} samples")
 
     eval_dataset = None
@@ -1636,6 +1800,8 @@ def main():
             args.max_length,
             num_task_tokens=args.num_task_tokens,
             type_aware_prompts=args.type_aware_prompts,
+            task_hint_top_k=args.task_hint_top_k,
+            balance_question_types=False,
         )
         log.info(
             f"Validation dataset: {len(eval_dataset)} samples | tokens={val_tokens_dir}")
@@ -1708,7 +1874,6 @@ def main():
             judge_max_new_tokens=args.judge_max_new_tokens,
             official_green_model=args.official_green_model,
             official_green_samples=args.official_green_samples,
-            constrained_generation=args.constrained_generation,
         )
 
     if trainer.is_world_process_zero() and not args.eval_only:

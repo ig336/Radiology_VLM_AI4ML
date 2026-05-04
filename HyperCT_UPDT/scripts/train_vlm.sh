@@ -86,8 +86,6 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" train_vlm.py
     --generation_eval_samples 512 \
     --generation_max_new_tokens 128 \
     --llm_score_samples 64 \
-    --green_score_samples 64 \
     --judge_max_new_tokens 160 \
-    --official_green_samples 0 \
     --bf16 \
     --attn_implementation sdpa
