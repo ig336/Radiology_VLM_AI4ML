@@ -1,15 +1,17 @@
 #!/bin/bash
-# Evaluate the completed epoch-1 VLM checkpoint with raw generation,
-# question-type prompts, and Stage 1 classifier finding hints.
-# This does not retrain and does not overwrite the original epoch-1 checkpoint.
-#SBATCH --job-name=hyperct_eval_vlm_typeaware
+# Continue from the completed epoch-1 VLM checkpoint for one focused epoch.
+# Training oversamples long/report samples, while final generation evaluation is
+# stratified across long, short, yes/no, MCQ, and report buckets. This keeps raw
+# generation honest: no output rewriting, no hard MCQ/yes-no conversion, and no
+# GREEN dependency.
+#SBATCH --job-name=hyperct_vlm_all_types
 #SBATCH -p sablab-gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=24:00:00
-#SBATCH --output=hyperct_eval_vlm_typeaware_%j.out
-#SBATCH --error=hyperct_eval_vlm_typeaware_%j.err
+#SBATCH --time=48:00:00
+#SBATCH --output=hyperct_vlm_all_types_%j.out
+#SBATCH --error=hyperct_vlm_all_types_%j.err
 
 set -euo pipefail
 module purge
@@ -29,15 +31,38 @@ pip install --force-reinstall --no-deps markupsafe==3.0.3
 PROJECT_DIR=/midtier/sablab/scratch/isg4006/VLM_Project/Radiology_VLM_AI4ML/Radiology_VLM_AI4ML/HyperCT_UPDT
 cd "$PROJECT_DIR"
 
-python train_vlm.py \
+if [ ! -f ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt ]; then
+    echo "Missing ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt"
+    exit 1
+fi
+
+if [ ! -d ./checkpoints/hyperct_vlm_epoch1/llm_lora ]; then
+    echo "Missing ./checkpoints/hyperct_vlm_epoch1/llm_lora"
+    exit 1
+fi
+
+NPROC_PER_NODE="${NPROC_PER_NODE:-}"
+if [ -z "$NPROC_PER_NODE" ]; then
+    NPROC_PER_NODE=$(python - <<'PY'
+import torch
+print(torch.cuda.device_count() if torch.cuda.is_available() else 0)
+PY
+)
+fi
+
+if [ "$NPROC_PER_NODE" -lt 1 ]; then
+    echo "No CUDA devices visible to the job. Check SLURM GPU allocation."
+    exit 1
+fi
+
+torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" train_vlm.py \
     --tokens_dir ./precompute_tokens_ff \
     --data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
     --val_tokens_dir ./precompute_tokens_valid_ff \
-    --output_dir ./checkpoints/hyperct_vlm_epoch1_typeaware_eval \
+    --output_dir ./checkpoints/hyperct_vlm_epoch1_all_types_focus \
     --qformer_checkpoint ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt \
     --llm_lora_checkpoint ./checkpoints/hyperct_vlm_epoch1/llm_lora \
-    --eval_only \
     --llm_name meta-llama/Llama-3.1-8B-Instruct \
     --llm_hidden_size 4096 \
     --vision_dim 768 \
@@ -47,6 +72,8 @@ python train_vlm.py \
     --lora_r 128 \
     --lora_alpha 256 \
     --lora_dropout 0.05 \
+    --lr 7.5e-6 \
+    --epochs 1 \
     --batch_size 4 \
     --eval_batch_size 4 \
     --grad_accum 2 \
@@ -54,11 +81,15 @@ python train_vlm.py \
     --num_task_tokens 3 \
     --eval_strategy epoch \
     --generation_eval_samples 512 \
-    --generation_max_new_tokens 128 \
+    --generation_eval_stratified \
+    --generation_eval_samples_per_bucket 100 \
+    --generation_max_new_tokens 256 \
     --generation_num_beams 1 \
     --type_aware_prompts \
-    --task_hint_top_k 3 \
+    --task_hint_top_k 5 \
+    --long_answer_oversample_factor 2 \
+    --report_generation_oversample_factor 8 \
     --llm_score_samples 64 \
-    --judge_max_new_tokens 160 \
+    --judge_max_new_tokens 220 \
     --bf16 \
     --attn_implementation sdpa

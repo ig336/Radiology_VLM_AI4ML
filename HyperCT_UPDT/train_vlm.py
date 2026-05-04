@@ -86,9 +86,11 @@ QUESTION_TYPE_LABELS = {
 
 TYPE_AWARE_INSTRUCTIONS = {
     "long_answer": (
-        "Answer as a radiologist using only findings supported by the CT. "
-        "Give the relevant positive and negative findings directly. Do not "
-        "invent uncertain findings."
+        "Answer as a radiologist using this compact structure: Findings: state "
+        "the CT-supported positive findings and relevant negatives asked by the "
+        "question. Impression: give the final clinical conclusion. Mention "
+        "location, laterality, and severity only when supported. Do not invent "
+        "uncertain findings."
     ),
     "short_answer": (
         "Answer concisely in one short phrase or sentence. If the question is "
@@ -99,9 +101,9 @@ TYPE_AWARE_INSTRUCTIONS = {
         "letter, then give at most one short justification."
     ),
     "report_generation": (
-        "Generate a concise radiology-style answer with Findings and Impression. "
-        "Use only CT-supported findings. Do not invent abnormalities, locations, "
-        "comparisons, or severity."
+        "Generate a concise radiology-style answer using exactly two sections: "
+        "Findings and Impression. Use only CT-supported findings. Do not invent "
+        "abnormalities, locations, comparisons, or severity."
     ),
 }
 TASK_ALIASES.update({
@@ -479,14 +481,18 @@ def sigmoid_np(values: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-values))
 
 
-def format_task_hint(task_names: List[str]) -> str:
-    if not task_names:
+def format_task_hint(task_scores: List[Tuple[str, float]]) -> str:
+    if not task_scores:
         return ""
-    readable = ", ".join(task.replace("_", " ") for task in task_names)
+    readable = ", ".join(
+        f"{task.replace('_', ' ')} ({prob:.2f})"
+        for task, prob in task_scores
+    )
     return (
-        "Stage 1 visual finding hints from the CT classifier: "
-        f"{readable}. Use these only as visual guidance; the final answer must "
-        "still match the question and avoid unsupported findings."
+        "Stage 1 visual finding hints from the CT classifier, with estimated "
+        f"presence probabilities: {readable}. Use these only as visual guidance; "
+        "the final answer must still match the question and avoid unsupported "
+        "findings."
     )
 
 
@@ -570,7 +576,9 @@ class VQADataset(Dataset):
                  max_length: int = 2048, num_task_tokens: int = 3,
                  type_aware_prompts: bool = False,
                  task_hint_top_k: int = 0,
-                 balance_question_types: bool = False):
+                 balance_question_types: bool = False,
+                 long_answer_oversample_factor: int = 1,
+                 report_generation_oversample_factor: int = 1):
         with open(data_json, "r") as f:
             raw_data = json.load(f)
         self.tokens_dir = tokens_dir
@@ -580,6 +588,8 @@ class VQADataset(Dataset):
         self.type_aware_prompts = type_aware_prompts
         self.task_hint_top_k = max(0, task_hint_top_k)
         self.balance_question_types = balance_question_types
+        self.long_answer_oversample_factor = max(1, long_answer_oversample_factor)
+        self.report_generation_oversample_factor = max(1, report_generation_oversample_factor)
         self._token_stems = self._discover_token_stems(tokens_dir)
         self._token_path_cache: Dict[str, str] = {}
 
@@ -629,6 +639,9 @@ class VQADataset(Dataset):
         if self.balance_question_types:
             self._balance_question_types()
             self._log_question_type_counts("Question type counts after balancing")
+        if self.long_answer_oversample_factor > 1 or self.report_generation_oversample_factor > 1:
+            self._oversample_long_report_types()
+            self._log_question_type_counts("Question type counts after long/report oversampling")
 
         # Llama 3.1 uses <|eot_id|> for end-of-turn, distinct from eos_token_id
         self.eot_token_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
@@ -676,6 +689,17 @@ class VQADataset(Dataset):
             if qtype not in QUESTION_TYPES:
                 balanced.extend(items)
         self.data = balanced
+
+    def _oversample_long_report_types(self) -> None:
+        factors = {
+            "long_answer": self.long_answer_oversample_factor,
+            "report_generation": self.report_generation_oversample_factor,
+        }
+        expanded = []
+        for item in self.data:
+            qtype = item.get("_question_type", "long_answer")
+            expanded.extend([item] * factors.get(qtype, 1))
+        self.data = expanded
 
     @staticmethod
     def _discover_token_stems(tokens_dir: str) -> set:
@@ -794,8 +818,11 @@ class VQADataset(Dataset):
         probs = sigmoid_np(diag)
         top_k = min(self.task_hint_top_k, len(RADIOLOGICAL_TASKS))
         top_indices = np.argsort(-probs)[:top_k]
-        task_names = [RADIOLOGICAL_TASKS[int(idx)] for idx in top_indices]
-        return format_task_hint(task_names)
+        task_scores = [
+            (RADIOLOGICAL_TASKS[int(idx)], float(probs[int(idx)]))
+            for idx in top_indices
+        ]
+        return format_task_hint(task_scores)
 
     def _format_training_text(self, item: dict) -> str:
         convs = item["conversations"]
@@ -940,6 +967,63 @@ class VQADataset(Dataset):
             "vision_tokens": vision_tokens,
             "image_positions": image_positions,
         }
+
+
+GENERATION_EVAL_BUCKETS = (
+    "long_answer",
+    "short_answer",
+    "yes_no",
+    "multiple_choice",
+    "report_generation",
+)
+
+
+def generation_eval_bucket(item: dict) -> str:
+    qtype = item.get("_question_type", "long_answer")
+    question = VQADataset._first_user_question(item)
+    if qtype == "short_answer" and is_yes_no_question(question):
+        return "yes_no"
+    return qtype if qtype in QUESTION_TYPES else "long_answer"
+
+
+def select_generation_eval_indices(
+    dataset: VQADataset,
+    max_samples: int,
+    stratified: bool,
+    samples_per_bucket: int,
+) -> List[int]:
+    if max_samples < 0:
+        return list(range(len(dataset)))
+
+    sample_count = min(max_samples, len(dataset))
+    if not stratified:
+        return list(range(sample_count))
+
+    groups: Dict[str, List[int]] = {bucket: [] for bucket in GENERATION_EVAL_BUCKETS}
+    for idx, item in enumerate(dataset.data):
+        bucket = generation_eval_bucket(item)
+        groups.setdefault(bucket, []).append(idx)
+
+    target = samples_per_bucket if samples_per_bucket > 0 else max(
+        1, math.ceil(sample_count / len(GENERATION_EVAL_BUCKETS))
+    )
+    selected = []
+    used = set()
+    for bucket in GENERATION_EVAL_BUCKETS:
+        for idx in groups.get(bucket, [])[:target]:
+            if idx not in used:
+                selected.append(idx)
+                used.add(idx)
+
+    if len(selected) < sample_count:
+        for idx in range(len(dataset)):
+            if idx not in used:
+                selected.append(idx)
+                used.add(idx)
+            if len(selected) >= sample_count:
+                break
+
+    return selected[:sample_count]
 
 
 def collate_fn(batch, pad_token_id: int):
@@ -1426,12 +1510,20 @@ def evaluate_generation(
     judge_max_new_tokens: int,
     official_green_model: str,
     official_green_samples: int,
+    stratified_eval: bool,
+    samples_per_eval_bucket: int,
 ) -> Dict[str, float]:
     """Generate answers on held-out VQA and compute answer/clinical metrics."""
     if max_samples == 0:
         return {}
 
-    sample_count = len(dataset) if max_samples < 0 else min(max_samples, len(dataset))
+    eval_indices = select_generation_eval_indices(
+        dataset,
+        max_samples=max_samples,
+        stratified=stratified_eval,
+        samples_per_bucket=samples_per_eval_bucket,
+    )
+    sample_count = len(eval_indices)
     if sample_count == 0:
         return {}
 
@@ -1464,8 +1556,11 @@ def evaluate_generation(
     predictions = []
     records = []
 
-    for idx in range(sample_count):
+    eval_bucket_counts = Counter()
+    for eval_pos, idx in enumerate(eval_indices):
         sample = dataset.build_generation_sample(idx)
+        eval_bucket = generation_eval_bucket(dataset.data[idx])
+        eval_bucket_counts[eval_bucket] += 1
         input_ids = sample["input_ids"].unsqueeze(0).to(device)
         attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
         vision_tokens = [sample["vision_tokens"].to(device)]
@@ -1543,6 +1638,8 @@ def evaluate_generation(
         records.append({
             "id": sample["id"],
             "image": sample["image"],
+            "eval_index": idx,
+            "eval_bucket": eval_bucket,
             "question": question,
             "question_type": question_type,
             "question_type_label": sample.get("question_type_label", question_type),
@@ -1555,8 +1652,8 @@ def evaluate_generation(
             "mcq_prediction_option": pred_mcq,
         })
 
-        if (idx + 1) % 50 == 0:
-            log.info(f"Generation eval: {idx + 1}/{sample_count} samples")
+        if (eval_pos + 1) % 50 == 0:
+            log.info(f"Generation eval: {eval_pos + 1}/{sample_count} samples")
 
     yes_no_scores = binary_scores(
         yes_no_counts["tp"], yes_no_counts["fp"],
@@ -1584,6 +1681,8 @@ def evaluate_generation(
 
     metrics = {
         "generation_samples": sample_count,
+        "generation_eval_stratified": bool(stratified_eval),
+        "generation_eval_bucket_counts": dict(sorted(eval_bucket_counts.items())),
         "generation_exact_match": exact / sample_count,
         "generation_token_f1": f1_sum / sample_count,
         "generation_bleu1": sum(bleu1_values) / len(bleu1_values) if bleu1_values else 0.0,
@@ -1705,6 +1804,10 @@ def main():
                         help="Add top-k Stage 1 classifier finding hints to VQA prompts")
     parser.add_argument("--balance_question_types", action="store_true",
                         help="Oversample minority question types in the training dataset")
+    parser.add_argument("--long_answer_oversample_factor", type=int, default=1,
+                        help="Duplicate long-answer training samples by this factor")
+    parser.add_argument("--report_generation_oversample_factor", type=int, default=1,
+                        help="Duplicate report-generation training samples by this factor")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--deepspeed", type=str, default=None)
     parser.add_argument("--qformer_checkpoint", type=str, default=None)
@@ -1715,6 +1818,10 @@ def main():
     parser.add_argument("--eval_steps", type=int, default=None)
     parser.add_argument("--generation_eval_samples", type=int, default=256,
                         help="Validation samples for generated-answer metrics; 0 disables, -1 uses all")
+    parser.add_argument("--generation_eval_stratified", action="store_true",
+                        help="Sample generation eval across long, short, yes/no, MCQ, and report buckets")
+    parser.add_argument("--generation_eval_samples_per_bucket", type=int, default=0,
+                        help="Samples per generation eval bucket when stratified; 0 auto-splits --generation_eval_samples")
     parser.add_argument("--generation_max_new_tokens", type=int, default=128)
     parser.add_argument("--generation_num_beams", type=int, default=1)
     parser.add_argument("--llm_score_samples", type=int, default=64,
@@ -1787,7 +1894,9 @@ def main():
                          num_task_tokens=args.num_task_tokens,
                          type_aware_prompts=args.type_aware_prompts,
                          task_hint_top_k=args.task_hint_top_k,
-                         balance_question_types=args.balance_question_types)
+                         balance_question_types=args.balance_question_types,
+                         long_answer_oversample_factor=args.long_answer_oversample_factor,
+                         report_generation_oversample_factor=args.report_generation_oversample_factor)
     log.info(f"Dataset: {len(dataset)} samples")
 
     eval_dataset = None
@@ -1802,6 +1911,8 @@ def main():
             type_aware_prompts=args.type_aware_prompts,
             task_hint_top_k=args.task_hint_top_k,
             balance_question_types=False,
+            long_answer_oversample_factor=1,
+            report_generation_oversample_factor=1,
         )
         log.info(
             f"Validation dataset: {len(eval_dataset)} samples | tokens={val_tokens_dir}")
@@ -1874,6 +1985,8 @@ def main():
             judge_max_new_tokens=args.judge_max_new_tokens,
             official_green_model=args.official_green_model,
             official_green_samples=args.official_green_samples,
+            stratified_eval=args.generation_eval_stratified,
+            samples_per_eval_bucket=args.generation_eval_samples_per_bucket,
         )
 
     if trainer.is_world_process_zero() and not args.eval_only:
