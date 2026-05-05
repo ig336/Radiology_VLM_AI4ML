@@ -1874,6 +1874,10 @@ def main():
             task_type="CAUSAL_LM",
         )
         llm = get_peft_model(llm, lora_config)
+    # Required for gradient checkpointing + PEFT + DDP: ensures gradients flow
+    # through checkpointed segments to LoRA params on all ranks.
+    if not args.eval_only:
+        llm.enable_input_require_grads()
     llm.print_trainable_parameters()
 
     # Q-Former adapter
@@ -1939,6 +1943,7 @@ def main():
         deepspeed=args.deepspeed,
         report_to="none",
         gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
         eval_strategy=eval_strategy,
         prediction_loss_only=True,
     )
