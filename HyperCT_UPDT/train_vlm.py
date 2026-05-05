@@ -1792,6 +1792,8 @@ def main():
                         help="Optional saved PEFT LoRA adapter directory for eval/resume-style loading")
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--max_steps", type=int, default=-1,
+                        help="Override epoch length with a fixed number of optimizer steps; -1 disables")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--eval_batch_size", type=int, default=None)
     parser.add_argument("--grad_accum", type=int, default=8)
@@ -1923,6 +1925,7 @@ def main():
     training_kwargs = dict(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
+        max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=eval_batch_size,
         gradient_accumulation_steps=args.grad_accum,

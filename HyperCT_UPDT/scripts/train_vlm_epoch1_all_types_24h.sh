@@ -1,17 +1,17 @@
 #!/bin/bash
-# Continue from the completed epoch-1 VLM checkpoint for one focused epoch.
-# Training oversamples long/report samples, while final generation evaluation is
-# stratified across long, short, yes/no, MCQ, and report buckets. This keeps raw
-# generation honest: no output rewriting, no hard MCQ/yes-no conversion, and no
-# GREEN dependency.
-#SBATCH --job-name=hyperct_vlm_all_types
+# Continue from the completed epoch-1 VLM checkpoint with a capped all-type
+# focused run intended to finish within 24h. Training keeps long/report emphasis,
+# but max_steps bounds runtime. Final generation evaluation is stratified across
+# long, short, yes/no, MCQ, and report buckets. Raw generation remains honest:
+# no output rewriting, no hard MCQ/yes-no conversion, and no GREEN dependency.
+#SBATCH --job-name=hyperct_vlm_24h
 #SBATCH -p sablab-gpu
 #SBATCH --gres=gpu:4
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
-#SBATCH --time=48:00:00
-#SBATCH --output=hyperct_vlm_all_types_%j.out
-#SBATCH --error=hyperct_vlm_all_types_%j.err
+#SBATCH --time=24:00:00
+#SBATCH --output=hyperct_vlm_24h_%j.out
+#SBATCH --error=hyperct_vlm_24h_%j.err
 
 set -euo pipefail
 module purge
@@ -60,7 +60,7 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" train_vlm.py
     --data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/train_vqa.json \
     --val_data_json /midtier/sablab/scratch/data/CT-RATEV2/data_volumes/dataset/vqa/valid_vqa.json \
     --val_tokens_dir ./precompute_tokens_valid_ff \
-    --output_dir ./checkpoints/hyperct_vlm_epoch1_all_types_focus \
+    --output_dir ./checkpoints/hyperct_vlm_epoch1_all_types_24h \
     --qformer_checkpoint ./checkpoints/hyperct_vlm_epoch1/qformer_final.pt \
     --llm_lora_checkpoint ./checkpoints/hyperct_vlm_epoch1/llm_lora \
     --llm_name meta-llama/Llama-3.1-8B-Instruct \
@@ -74,22 +74,23 @@ torchrun --standalone --nnodes=1 --nproc_per_node="$NPROC_PER_NODE" train_vlm.py
     --lora_dropout 0.05 \
     --lr 7.5e-6 \
     --epochs 1 \
+    --max_steps 12000 \
     --batch_size 4 \
     --eval_batch_size 4 \
     --grad_accum 2 \
     --max_length 2048 \
     --num_task_tokens 3 \
     --eval_strategy epoch \
-    --generation_eval_samples 512 \
+    --generation_eval_samples 256 \
     --generation_eval_stratified \
-    --generation_eval_samples_per_bucket 100 \
-    --generation_max_new_tokens 256 \
+    --generation_eval_samples_per_bucket 50 \
+    --generation_max_new_tokens 192 \
     --generation_num_beams 1 \
     --type_aware_prompts \
     --task_hint_top_k 5 \
     --long_answer_oversample_factor 2 \
-    --report_generation_oversample_factor 8 \
+    --report_generation_oversample_factor 4 \
     --llm_score_samples 64 \
-    --judge_max_new_tokens 220 \
+    --judge_max_new_tokens 180 \
     --bf16 \
     --attn_implementation sdpa
